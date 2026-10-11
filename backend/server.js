@@ -1,15 +1,37 @@
 
 require("dotenv").config();
 const express = require("express");
+const path = require("path");
+const fs = require("fs");
 const mysql = require("mysql2");
 const cors = require("cors");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+const allowedOrigins = new Set([
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "capacitor://localhost",
+    "http://localhost",
+    "https://localhost",
+    ...(process.env.CORS_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean)
+]);
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+        return callback(new Error("Origin is not allowed by CORS."));
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Kiosk-Key"]
+}));
+app.use(express.json({ limit: "1mb" }));
 
 // Nodemailer Gmail Setup
 const EMAIL_USER = process.env.EMAIL_USER || "";
@@ -28,71 +50,73 @@ if (EMAIL_USER && EMAIL_PASS && EMAIL_USER !== "your-gmail@gmail.com") {
     console.log("Nodemailer Gmail Transporter configured for:", EMAIL_USER);
 }
 
-// MySQL connection
-const db = mysql.createConnection({
-    host: "localhost",
-    user: "root",
-    password:"Sharu@2008",
-    database: "lems_db"
+// Use Railway's MySQL variables; schema migrations must be run separately.
+const db = mysql.createPool({
+    host: process.env.MYSQLHOST || process.env.DB_HOST || "127.0.0.1",
+    user: process.env.MYSQLUSER || process.env.DB_USER || "root",
+    password: process.env.MYSQLPASSWORD || process.env.DB_PASSWORD || "",
+    database: process.env.MYSQLDATABASE || process.env.DB_NAME || "lems_db",
+    port: Number(process.env.MYSQLPORT || process.env.DB_PORT || 3306),
+    waitForConnections: true,
+    connectionLimit: Number(process.env.DB_POOL_SIZE || 10),
+    queueLimit: 0
+});
+const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === "production" ? "" : "local-development-only-change-this-secret");
+if (!JWT_SECRET) throw new Error("JWT_SECRET must be configured in production.");
+if (process.env.NODE_ENV !== "production" && !process.env.JWT_SECRET) console.warn("Using a development-only JWT secret.");
+const FRONTEND_DIST = path.join(__dirname, "..", "frontend-react", "dist");
+
+db.getConnection((err, connection) => {
+    if (err) {
+        console.error("MySQL connection failed. Check the MYSQL* environment variables:", err.message);
+        return;
+    }
+    connection.release();
+    console.log("MySQL connection established.");
 });
 
-// Connect to MySQL
-db.connect((err) => {
-    if (err) {
-        console.error("MySQL connection failed:", err.message);
-    } else {
-        console.log("MySQL connected successfully!");
-
-        // Ensure reset_token and reset_token_expires columns exist in users table
-        db.query("ALTER TABLE users ADD COLUMN reset_token VARCHAR(255) NULL, ADD COLUMN reset_token_expires DATETIME NULL", (err) => {
-            // Ignore error if columns already exist
-        });
-
-        // Ensure complaints table exists
-        const createComplaintsTableSql = `
-            CREATE TABLE IF NOT EXISTS complaints (
-                complaint_id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NULL,
-                equipment_id INT NULL,
-                issue_description TEXT NOT NULL,
-                status VARCHAR(50) DEFAULT 'PENDING',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        `;
-        db.query(createComplaintsTableSql, (err) => {
-            if (err) console.error("Could not create complaints table:", err.message);
-        });
-
-        // Ensure total_quantity and available_quantity columns exist in equipment table
-        db.query("ALTER TABLE equipment ADD COLUMN total_quantity INT DEFAULT 50, ADD COLUMN available_quantity INT DEFAULT 50", (err) => {
-            db.query("UPDATE equipment SET total_quantity = 50 WHERE total_quantity IS NULL OR total_quantity = 0");
-            db.query("UPDATE equipment SET available_quantity = 50 WHERE available_quantity IS NULL");
-            db.query("UPDATE equipment SET status = 'AVAILABLE' WHERE available_quantity > 0 AND status NOT IN ('MAINTENANCE', 'LOST')");
-        });
-
-        // Auto-create an example admin if no admin exists in users table
-        const checkAdminSql = "SELECT * FROM users WHERE LOWER(role) = 'admin'";
-        db.query(checkAdminSql, (err, rows) => {
-            if (!err && rows.length === 0) {
-                const createAdminSql = `
-                    INSERT INTO users (name, student_id, email, password, role)
-                    VALUES ('Lab Admin', 'A101', 'admin@lems.com', 'admin123', 'admin')
-                `;
-                db.query(createAdminSql, (err) => {
-                    if (!err) {
-                        console.log("Created default Admin user -> ID: A101 | Password: admin123");
-                    } else {
-                        console.error("Could not auto-create admin:", err.message);
-                    }
-                });
-            }
-        });
+const authenticateToken = (req, res, next) => {
+    const header = req.get("authorization") || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+    if (!token) return res.status(401).json({ message: "Please sign in to continue." });
+    jwt.verify(token, JWT_SECRET, { issuer: "lems-api", audience: "lems-app" }, (err, payload) => {
+        if (err) return res.status(401).json({ message: "Session expired or invalid. Please sign in again." });
+        req.user = payload;
+        next();
+    });
+};
+const requireAdmin = (req, res, next) => {
+    if (!req.user || String(req.user.role || "").toLowerCase() !== "admin") {
+        return res.status(403).json({ message: "Administrator access is required." });
     }
+    next();
+};
+const verifyKioskKey = (req, res, next) => {
+    const expected = process.env.KIOSK_API_KEY;
+    if (!expected) return res.status(503).json({ message: "Kiosk integration is not enabled." });
+    if ((req.get("x-kiosk-key") || "") !== expected) return res.status(401).json({ message: "Invalid kiosk credentials." });
+    next();
+};
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { message: "Too many attempts. Please try again later." }
 });
 
 // Home API
 app.get("/", (req, res) => {
-    res.send("LEMS Backend API is running");
+    const indexPath = path.join(FRONTEND_DIST, "index.html");
+    if (fs.existsSync(indexPath)) return res.sendFile(indexPath);
+    res.send("LEMS Backend API is running. Build the React frontend to serve the web app.");
+});
+
+app.get("/health", (req, res) => {
+    db.query("SELECT 1 AS ok", (error) => {
+        if (error) return res.status(503).json({ status: "degraded", database: "unavailable" });
+        res.json({ status: "ok", database: "connected" });
+    });
 });
 
 // Get all equipment
@@ -106,7 +130,7 @@ app.get("/api/equipment", (req, res) => {
     });
 });
 
-app.put("/api/equipment/:id", (req, res) => {
+app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
     const { id } = req.params;
     const {
         equipment_code,
@@ -374,9 +398,9 @@ app.post("/api/reset-password", (req, res) => {
 });
 
 // Submit Complaint / Maintenance Request API (Student Side)
-app.post("/api/complaints", (req, res) => {
-    console.log("POST /api/complaints received body:", req.body);
-    const { user_id, equipment_id, issue_description } = req.body;
+app.post("/api/complaints", authenticateToken, (req, res) => {
+    const { equipment_id, issue_description } = req.body || {};
+    const user_id = req.user.user_id;
 
     if (!user_id || !equipment_id || !issue_description) {
         return res.status(400).json({ message: "User ID, Equipment ID, and Issue Description are required." });
@@ -405,7 +429,7 @@ app.post("/api/complaints", (req, res) => {
 });
 
 // Get All Complaints API (Admin Side)
-app.get("/api/complaints", (req, res) => {
+app.get("/api/complaints", authenticateToken, requireAdmin, (req, res) => {
     const sql = `
         SELECT
             c.complaint_id,
@@ -436,7 +460,7 @@ app.get("/api/complaints", (req, res) => {
 });
 
 // Resolve Complaint API (Admin Side)
-app.put("/api/complaints/:id/resolve", (req, res) => {
+app.put("/api/complaints/:id/resolve", authenticateToken, requireAdmin, (req, res) => {
     const complaintId = req.params.id;
     const { equipment_id, make_available } = req.body;
 
@@ -458,8 +482,9 @@ app.put("/api/complaints/:id/resolve", (req, res) => {
 });
 
 // Checkout equipment API
-app.post("/api/checkout", (req, res) => {
-    const { user_id, equipment_id } = req.body;
+app.post("/api/checkout", authenticateToken, (req, res) => {
+    const { equipment_id } = req.body || {};
+    const user_id = req.user.user_id;
 
     if (!user_id || !equipment_id) {
         return res.status(400).json({
@@ -563,8 +588,10 @@ app.post("/api/checkout", (req, res) => {
 });
 
 // Return equipment API
-app.post("/api/return", (req, res) => {
-    const { equipment_id } = req.body;
+app.post("/api/return", authenticateToken, (req, res) => {
+    const { equipment_id } = req.body || {};
+    const currentUserId = req.user.user_id;
+    const isAdministrator = String(req.user.role || "").toLowerCase() === "admin";
 
     if (!equipment_id) {
         return res.status(400).json({
@@ -577,11 +604,12 @@ app.post("/api/return", (req, res) => {
         FROM transactions
         WHERE equipment_id = ?
           AND status = 'ACTIVE'
+          AND (? = 1 OR user_id = ?)
         ORDER BY checkout_time DESC
         LIMIT 1
     `;
 
-    db.query(sql, [equipment_id], (err, results) => {
+    db.query(sql, [equipment_id, isAdministrator ? 1 : 0, currentUserId], (err, results) => {
         if (err) {
             return res.status(500).json({ error: err.message });
         }
@@ -633,7 +661,7 @@ app.post("/api/return", (req, res) => {
 });
 
 // RFID Kiosk Scan API (ESP32 Hardware Integration)
-app.post("/api/kiosk/scan", (req, res) => {
+app.post("/api/kiosk/scan", verifyKioskKey, (req, res) => {
     const { student_rfid, equipment_rfid } = req.body;
 
     if (!student_rfid || !equipment_rfid) {
@@ -722,7 +750,7 @@ app.get("/api/transactions/user/:user_id", (req, res) => {
 });
 
 // Transaction history API
-app.get("/api/transactions", (req, res) => {
+app.get("/api/transactions", authenticateToken, requireAdmin, (req, res) => {
     console.log("API /api/transactions requested");
     const sql = `
         SELECT
@@ -752,7 +780,7 @@ app.get("/api/transactions", (req, res) => {
 });
 
 // Admin API: Get student account details & transaction history by student_id
-app.get("/api/admin/student/:student_id", (req, res) => {
+app.get("/api/admin/student/:student_id", authenticateToken, requireAdmin, (req, res) => {
     const studentId = req.params.student_id;
 
     const userSql = "SELECT user_id, name, student_id, email, role FROM users WHERE student_id = ?";
@@ -797,9 +825,9 @@ app.get("/api/admin/student/:student_id", (req, res) => {
 });
 
 // Start server — keep this at the bottom
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-app.post("/api/equipment", (req, res) => {
+app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
     const {
         equipment_code,
         name,
@@ -856,6 +884,13 @@ app.post("/api/equipment", (req, res) => {
         });
     });
 });
+app.use(express.static(FRONTEND_DIST));
+app.get("/{*splat}", (req, res, next) => {
+    if (req.path.startsWith("/api/")) return res.status(404).json({ message: "API route not found." });
+    const indexPath = path.join(FRONTEND_DIST, "index.html");
+    if (fs.existsSync(indexPath)) return res.sendFile(indexPath);
+    next();
+});
 app.listen(PORT, () => {
-    console.log(`LEMS API running on port ${PORT}`);
+    console.log("LEMS API running on port " + PORT);
 });
