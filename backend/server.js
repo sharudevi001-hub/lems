@@ -28,7 +28,7 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(cors({
     origin(origin, callback) {
         if (!origin || allowedOrigins.has(origin)) return callback(null, true);
-        return callback(new Error("Origin is not allowed by CORS."));
+        return callback(null, false);
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Kiosk-Key"]
