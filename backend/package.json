@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "db:check": "node scripts/check-schema.js",
+    "admin:provision": "node scripts/provision-admin.js"
   },
   "keywords": [
     "LEMS",
