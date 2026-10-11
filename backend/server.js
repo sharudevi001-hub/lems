@@ -13,6 +13,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
 const app = express();
+app.set("trust proxy", 1);
 
 const allowedOrigins = new Set([
     "http://localhost:5173",
@@ -310,10 +311,7 @@ app.post("/api/forgot-password", loginLimiter, (req, res) => {
 
             const appBaseUrl = (process.env.APP_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
             const resetLink = `${appBaseUrl}/reset-password?token=${encodeURIComponent(token)}`;
-            console.log("\n==========================================");
-            console.log(`PASSWORD RESET LINK FOR ${user.email}:`);
             // Never write password-reset tokens to application logs.
-            console.log("==========================================\n");
 
             // Send real email if Gmail credentials are provided
             if (transporter) {
@@ -378,9 +376,10 @@ app.post("/api/reset-password", loginLimiter, (req, res) => {
 
         const user = users[0];
 
-        // Expiration check in JS to prevent MySQL timezone mismatches
-        if (user.reset_token_expires && new Date(user.reset_token_expires).getTime() < Date.now()) {
-            return res.status(400).json({ message: "Password reset link has expired. Please request a new one." });
+        // Expired, missing, and invalid expiry timestamps must all be rejected.
+        const expiryMs = user.reset_token_expires ? new Date(user.reset_token_expires).getTime() : Number.NaN;
+        if (!Number.isFinite(expiryMs) || expiryMs < Date.now()) {
+            return res.status(400).json({ message: "Invalid or expired password-reset link." });
         }
 
         if (String(new_password).length < 8 || String(new_password).length > 128) {
