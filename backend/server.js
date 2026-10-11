@@ -732,16 +732,21 @@ app.post("/api/kiosk/scan", verifyKioskKey, (req, res) => {
 });
 
 // Get active checkouts for a specific user
-app.get("/api/transactions/user/:user_id", (req, res) => {
-    const userId = req.params.user_id;
-    const sql = `
-        SELECT transaction_id, equipment_id, checkout_time, status
-        FROM transactions
-        WHERE user_id = ? AND status = 'ACTIVE'
-    `;
-    db.query(sql, [userId], (err, results) => {
+app.get("/api/transactions/user/:user_id", authenticateToken, (req, res) => {
+    const requestedUserId = String(req.params.user_id);
+    const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
+    if (!isAdmin && requestedUserId !== String(req.user.user_id)) {
+        return res.status(403).json({ message: "Transaction access denied." });
+    }
+    const history = String(req.query.history || "").toLowerCase() === "true";
+    const statusClause = history ? "" : "AND t.status = 'ACTIVE'";
+    const sql = "SELECT t.transaction_id, t.equipment_id, e.equipment_code, e.name AS equipment_name, t.checkout_time, t.return_time, t.status " +
+        "FROM transactions t LEFT JOIN equipment e ON e.equipment_id = t.equipment_id WHERE t.user_id = ? " + statusClause +
+        " ORDER BY t.transaction_id DESC";
+    db.query(sql, [requestedUserId], (err, results) => {
         if (err) {
-            return res.status(500).json({ error: err.message });
+            console.error("User transactions request failed:", err.message);
+            return res.status(500).json({ message: "Could not load transactions." });
         }
         res.json(results);
     });
