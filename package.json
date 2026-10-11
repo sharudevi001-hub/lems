@@ -1,0 +1,12 @@
+{
+  "name": "lems",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LEMS Lab Equipment Management System",
+  "scripts": {
+    "build": "npm --prefix backend install --omit=dev && npm --prefix frontend-react install && npm --prefix frontend-react run build",
+    "start": "node backend/server.js",
+    "dev:frontend": "npm --prefix frontend-react run dev",
+    "dev:backend": "npm --prefix backend run dev"
+  }
+}
