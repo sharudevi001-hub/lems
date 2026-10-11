@@ -278,7 +278,7 @@ app.post("/api/login", loginLimiter, (req, res) => {
 });
 
 // Forgot Password API - Generates reset link & sends real email
-app.post("/api/forgot-password", (req, res) => {
+app.post("/api/forgot-password", loginLimiter, (req, res) => {
     const { email } = req.body;
 
     if (!email) {
@@ -308,10 +308,11 @@ app.post("/api/forgot-password", (req, res) => {
                 return res.status(500).json({ error: err.message });
             }
 
-            const resetLink = `http://127.0.0.1:8080/reset-password.html?token=${token}`;
+            const appBaseUrl = (process.env.APP_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+            const resetLink = `${appBaseUrl}/reset-password?token=${encodeURIComponent(token)}`;
             console.log("\n==========================================");
             console.log(`PASSWORD RESET LINK FOR ${user.email}:`);
-            console.log(resetLink);
+            // Never write password-reset tokens to application logs.
             console.log("==========================================\n");
 
             // Send real email if Gmail credentials are provided
@@ -348,16 +349,16 @@ app.post("/api/forgot-password", (req, res) => {
                 });
             }
 
-            res.json({
-                message: "Password reset link generated! Check your email inbox.",
-                resetLink: resetLink
-            });
+            if (process.env.NODE_ENV === "production") {
+                return res.json({ message: "If the account exists, password-reset instructions will be sent to its registered email." });
+            }
+            res.json({ message: "Password reset request processed.", resetLink: resetLink });
         });
     });
 });
 
 // Reset Password API - Updates password using token
-app.post("/api/reset-password", (req, res) => {
+app.post("/api/reset-password", loginLimiter, (req, res) => {
     const { token, new_password } = req.body;
 
     if (!token || !new_password) {
