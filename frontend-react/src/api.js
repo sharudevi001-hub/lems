@@ -37,6 +37,7 @@ export const api = {
   allTransactions: () => request("transactions"),
   addEquipment: data => request("equipment", { method: "POST", body: JSON.stringify(data) }),
   updateEquipment: (id, data) => request("equipment/" + encodeURIComponent(id), { method: "PUT", body: JSON.stringify(data) }),
+  submitComplaint: (equipment_id, issue_description) => request("complaints", { method: "POST", body: JSON.stringify({ equipment_id, issue_description }) }),
   complaints: () => request("complaints"),
   resolveComplaint: (id, data) => request("complaints/" + encodeURIComponent(id) + "/resolve", { method: "PUT", body: JSON.stringify(data) }),
   findStudent: id => request("admin/student/" + encodeURIComponent(id)),
