@@ -7,7 +7,9 @@
     "build": "npm --prefix backend install --omit=dev && npm --prefix frontend-react install && npm --prefix frontend-react run build",
     "start": "node backend/server.js",
     "dev:frontend": "npm --prefix frontend-react run dev",
-    "dev:backend": "npm --prefix backend run dev"
+    "dev:backend": "npm --prefix backend run dev",
+    "db:check": "npm --prefix backend run db:check",
+    "admin:provision": "npm --prefix backend run admin:provision"
   },
   "engines": {
     "node": ">=22.12.0"
