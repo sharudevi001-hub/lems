@@ -21,6 +21,7 @@ const allowedOrigins = new Set([
     "capacitor://localhost",
     "http://localhost",
     "https://localhost",
+    ...(process.env.APP_BASE_URL ? [process.env.APP_BASE_URL.replace(/\/+$/, "")] : []),
     ...(process.env.CORS_ORIGINS || "").split(",").map(value => value.trim()).filter(Boolean)
 ]);
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
