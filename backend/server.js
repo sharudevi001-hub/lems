@@ -120,7 +120,7 @@ app.get("/health", (req, res) => {
 });
 
 // Get all equipment
-app.get("/api/equipment", (req, res) => {
+app.get("/api/equipment", authenticateToken, (req, res) => {
     db.query("SELECT * FROM equipment", (err, results) => {
         if (err) {
             return res.status(500).json({ error: err.message });
@@ -382,15 +382,20 @@ app.post("/api/reset-password", (req, res) => {
             return res.status(400).json({ message: "Password reset link has expired. Please request a new one." });
         }
 
+        if (String(new_password).length < 8 || String(new_password).length > 128) {
+            return res.status(400).json({ message: "Password must be between 8 and 128 characters." });
+        }
         const userId = user.user_id;
-        const updateSql = "UPDATE users SET password = ?, reset_token = NULL, reset_token_expires = NULL WHERE user_id = ?";
-        db.query(updateSql, [new_password.trim(), userId], (err) => {
-            if (err) {
-                console.error("Password update error:", err);
-                return res.status(500).json({ error: err.message });
-            }
-
-            res.json({ message: "Password reset successful! You can now log in with your new password." });
+        bcrypt.hash(String(new_password), 12, (hashError, passwordHash) => {
+            if (hashError) return res.status(500).json({ message: "Could not secure the new password." });
+            const updateSql = "UPDATE users SET password = ?, reset_token = NULL, reset_token_expires = NULL WHERE user_id = ?";
+            db.query(updateSql, [passwordHash, userId], (updateError) => {
+                if (updateError) {
+                    console.error("Password update failed:", updateError.message);
+                    return res.status(500).json({ message: "Password reset failed." });
+                }
+                res.json({ message: "Password reset successful. You can now sign in." });
+            });
         });
     });
 });
