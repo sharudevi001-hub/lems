@@ -202,81 +202,79 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
 });
 
 // Sign Up / Registration API
-app.post("/api/signup", (req, res) => {
-    const { name, student_id, email, password, role } = req.body;
-
-    if (!name || !student_id || !email || !password) {
-        return res.status(400).json({
-            message: "Name, Student ID, Email, and Password are required."
-        });
-    }
-
-    const userRole = (role && String(role).toLowerCase() === "admin") ? "admin" : "student";
-
-    // Check if student_id or email already exists
-    const checkSql = "SELECT user_id FROM users WHERE student_id = ? OR email = ?";
-    db.query(checkSql, [student_id.trim(), email.trim()], (err, results) => {
+app.post("/api/signup", loginLimiter, (req, res) => {
+    const { name, student_id, email, password } = req.body || {};
+    if (!name || !student_id || !email || !password) return res.status(400).json({ message: "Name, student ID, email, and password are required." });
+    if (String(password).length < 8 || String(password).length > 128) return res.status(400).json({ message: "Password must be between 8 and 128 characters." });
+    const cleanName = String(name).trim();
+    const cleanStudentId = String(student_id).trim();
+    const cleanEmail = String(email).trim().toLowerCase();
+    if (!cleanName || !cleanStudentId || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return res.status(400).json({ message: "Enter a valid name, student ID, and email." });
+    db.query("SELECT user_id FROM users WHERE student_id = ? OR email = ?", [cleanStudentId, cleanEmail], (err, rows) => {
         if (err) {
-            console.error("Signup check error:", err.message);
-            return res.status(500).json({ error: err.message });
+            console.error("Signup check failed:", err.message);
+            return res.status(500).json({ message: "Could not create the account right now." });
         }
-
-        if (results.length > 0) {
-            return res.status(400).json({
-                message: "User with this Student ID or Email already exists."
-            });
-        }
-
-        // Insert new user into database
-        const insertSql = `
-            INSERT INTO users (name, student_id, email, password, role)
-            VALUES (?, ?, ?, ?, ?)
-        `;
-
-        db.query(insertSql, [name.trim(), student_id.trim(), email.trim(), password.trim(), userRole], (err, result) => {
-            if (err) {
-                console.error("Signup insert error:", err.message);
-                return res.status(500).json({ error: err.message });
-            }
-
-            res.status(201).json({
-                message: "Account created successfully! You can now log in."
-            });
+        if (rows.length) return res.status(409).json({ message: "An account with that student ID or email already exists." });
+        bcrypt.hash(String(password), 12, (hashError, passwordHash) => {
+            if (hashError) return res.status(500).json({ message: "Could not secure the password." });
+            db.query("INSERT INTO users (name, student_id, email, password, role) VALUES (?, ?, ?, ?, 'student')",
+                [cleanName, cleanStudentId, cleanEmail, passwordHash], (insertError) => {
+                    if (insertError) {
+                        if (insertError.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "An account with that student ID or email already exists." });
+                        console.error("Signup insert failed:", insertError.message);
+                        return res.status(500).json({ message: "Could not create the account right now." });
+                    }
+                    res.status(201).json({ message: "Account created successfully. You can now sign in." });
+                });
         });
     });
 });
 
-app.post("/api/login", (req, res) => {
-    const { student_id, password } = req.body;
-
-    if (!student_id || !password) {
-        return res.status(400).json({
-            message: "Student ID and password are required"
+app.post("/api/login", loginLimiter, (req, res) => {
+    const { student_id, password } = req.body || {};
+    if (!student_id || !password) return res.status(400).json({ message: "Student ID and password are required." });
+    db.query("SELECT user_id, name, student_id, email, role, password FROM users WHERE student_id = ? LIMIT 1",
+        [String(student_id).trim()], async (err, rows) => {
+            if (err) {
+                console.error("Login database error:", err.message);
+                return res.status(500).json({ message: "Login is temporarily unavailable." });
+            }
+            if (!rows.length) return res.status(401).json({ message: "Invalid student ID or password." });
+            const row = rows[0];
+            const stored = String(row.password || "");
+            let matches = false;
+            try {
+                matches = /^\$2[aby]\$/.test(stored) ? await bcrypt.compare(String(password), stored) : stored === String(password);
+            } catch (verifyError) {
+                console.error("Password verification error:", verifyError.message);
+                return res.status(500).json({ message: "Login is temporarily unavailable." });
+            }
+            if (!matches) return res.status(401).json({ message: "Invalid student ID or password." });
+            if (!/^\$2[aby]\$/.test(stored)) {
+                try {
+                    const upgraded = await bcrypt.hash(String(password), 12);
+                    db.query("UPDATE users SET password = ? WHERE user_id = ?", [upgraded, row.user_id], upgradeError => {
+                        if (upgradeError) console.error("Legacy password upgrade failed:", upgradeError.message);
+                    });
+                } catch (hashError) {
+                    console.error("Password rehash failed:", hashError.message);
+                }
+            }
+            const user = {
+                user_id: row.user_id,
+                name: row.name,
+                student_id: row.student_id,
+                email: row.email,
+                role: String(row.role || "student").toLowerCase()
+            };
+            const token = jwt.sign(
+                { user_id: user.user_id, student_id: user.student_id, role: user.role },
+                JWT_SECRET,
+                { expiresIn: "8h", issuer: "lems-api", audience: "lems-app" }
+            );
+            res.json({ message: "Login successful", user, token });
         });
-    }
-
-    const sql = `
-        SELECT user_id, name, student_id, email, role
-        FROM users
-        WHERE student_id = ? AND password = ?
-    `;
-
-    db.query(sql, [student_id, password], (err, results) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-
-        if (results.length === 0) {
-            return res.status(401).json({
-                message: "Invalid student ID or password"
-            });
-        }
-
-        res.json({
-            message: "Login successful",
-            user: results[0]
-        });
-    });
 });
 
 // Forgot Password API - Generates reset link & sends real email
