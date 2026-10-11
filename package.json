@@ -8,5 +8,8 @@
     "start": "node backend/server.js",
     "dev:frontend": "npm --prefix frontend-react run dev",
     "dev:backend": "npm --prefix backend run dev"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }
