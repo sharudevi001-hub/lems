@@ -1,4 +1,15 @@
-node_modules/
 .env
 .env.*
 !.env.example
+node_modules/
+**/node_modules/
+frontend-react/dist/
+backend/coverage/
+coverage/
+*.log
+.DS_Store
+Thumbs.db
+*.keystore
+*.jks
+android/.gradle/
+android/local.properties
