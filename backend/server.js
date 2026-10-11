@@ -281,77 +281,58 @@ app.post("/api/login", loginLimiter, (req, res) => {
 
 // Forgot Password API - Generates reset link & sends real email
 app.post("/api/forgot-password", loginLimiter, (req, res) => {
-    const { email } = req.body;
+    const email = String((req.body || {}).email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ message: "Email is required." });
 
-    if (!email) {
-        return res.status(400).json({ message: "Email is required." });
+    // Production reset emails must be configured before a token is created.
+    if (process.env.NODE_ENV === "production" && !transporter) {
+        return res.status(503).json({ message: "Password-reset email is not configured. Please contact the lab administrator." });
     }
 
-    const checkSql = "SELECT user_id, name, email FROM users WHERE email = ?";
-    db.query(checkSql, [email.trim()], (err, users) => {
+    const checkSql = "SELECT user_id, name, email FROM users WHERE LOWER(email) = ? LIMIT 1";
+    db.query(checkSql, [email], (err, users) => {
         if (err) {
-            console.error("Forgot password SQL error:", err);
-            return res.status(500).json({ error: err.message });
+            console.error("Forgot-password lookup failed:", err.message);
+            return res.status(500).json({ message: "Password reset is temporarily unavailable." });
         }
-
-        if (users.length === 0) {
+        if (!users.length) {
+            if (process.env.NODE_ENV === "production") {
+                return res.json({ message: "If the account exists, password-reset instructions will be sent to its registered email." });
+            }
             return res.status(404).json({ message: "No account found with this email address." });
         }
 
         const user = users[0];
-        const token = crypto.randomBytes(20).toString("hex");
-        // Expires in 1 hour
-        const expires = new Date(Date.now() + 3600000);
-
-        const updateSql = "UPDATE users SET reset_token = ?, reset_token_expires = ? WHERE user_id = ?";
-        db.query(updateSql, [token, expires, user.user_id], (err) => {
-            if (err) {
-                console.error("Token save error:", err);
-                return res.status(500).json({ error: err.message });
+        const token = crypto.randomBytes(32).toString("hex");
+        const expires = new Date(Date.now() + 60 * 60 * 1000);
+        db.query("UPDATE users SET reset_token = ?, reset_token_expires = ? WHERE user_id = ?", [token, expires, user.user_id], (updateError) => {
+            if (updateError) {
+                console.error("Could not save password-reset token:", updateError.message);
+                return res.status(500).json({ message: "Password reset is temporarily unavailable." });
             }
 
-            const appBaseUrl = (process.env.APP_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
-            const resetLink = `${appBaseUrl}/reset-password?token=${encodeURIComponent(token)}`;
-            // Never write password-reset tokens to application logs.
-
-            // Send real email if Gmail credentials are provided
-            if (transporter) {
-                const mailOptions = {
-                    from: `"LEMS System" <${EMAIL_USER}>`,
-                    to: user.email,
-                    subject: "LEMS - Password Reset Request",
-                    html: `
-                        <div style="font-family: Arial, sans-serif; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
-                            <h2 style="color: #1976d2;">LEMS - Password Reset Request</h2>
-                            <p>Hello <strong>${String(user.name || "User")}</strong>,</p>
-                            <p>You requested to reset your password for your LEMS account.</p>
-                            <p>Click the button below to reset your password (link expires in 1 hour):</p>
-                            <p style="margin: 20px 0;">
-                                <a href="${resetLink}" style="display: inline-block; padding: 12px 24px; background-color: #1976d2; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">
-                                    Reset Password
-                                </a>
-                            </p>
-                            <p style="color: #666; font-size: 13px;">Or copy and paste this URL into your browser:</p>
-                            <p style="color: #1976d2; font-size: 13px;">${resetLink}</p>
-                            <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
-                            <p style="font-size: 12px; color: #999;">If you did not request a password reset, please ignore this email.</p>
-                        </div>
-                    `
-                };
-
-                transporter.sendMail(mailOptions, (mailErr, info) => {
-                    if (mailErr) {
-                        console.error("Nodemailer Email delivery error:", mailErr.message);
-                    } else {
-                        console.log("Real email sent to:", user.email, "| Status:", info.response);
-                    }
-                });
-            }
-
-            if (process.env.NODE_ENV === "production") {
-                return res.json({ message: "If the account exists, password-reset instructions will be sent to its registered email." });
-            }
-            res.json({ message: "Password reset request processed.", resetLink: resetLink });
+            const baseUrl = (process.env.APP_BASE_URL || (req.protocol + "://" + req.get("host"))).replace(/\/+$/, "");
+            const resetLink = baseUrl + "/reset-password?token=" + encodeURIComponent(token);
+            const mailOptions = {
+                from: '"LEMS System" <' + EMAIL_USER + ">",
+                to: user.email,
+                subject: "LEMS - Password Reset Request",
+                text: "A password reset was requested for your LEMS account. This link expires in one hour: " + resetLink + "\nIf you did not request this, ignore this email.",
+                html: '<div style="font-family:Arial,sans-serif;padding:20px"><h2>LEMS password reset</h2><p>Hello ' +
+                    String(user.name || "User").replace(/[&<>"]/g, "") +
+                    ',</p><p>Use this one-hour link to reset your LEMS password:</p><p><a href="' + resetLink + '">Reset password</a></p><p>If you did not request this, ignore this email.</p></div>'
+            };
+            transporter.sendMail(mailOptions, (mailError) => {
+                if (mailError) {
+                    console.error("Password-reset email delivery failed:", mailError.message);
+                    return res.status(503).json({ message: "Password-reset email could not be sent. Please contact the lab administrator." });
+                }
+                // Prevent account enumeration in production.
+                if (process.env.NODE_ENV === "production") {
+                    return res.json({ message: "If the account exists, password-reset instructions will be sent to its registered email." });
+                }
+                res.json({ message: "Password reset email sent.", resetLink });
+            });
         });
     });
 });
