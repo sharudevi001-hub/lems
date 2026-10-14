@@ -32,37 +32,29 @@ function PageTitle({ title, subtitle, actions }) {
   return <div className="page-title"><div><p className="eyebrow">LEMS WORKSPACE</p><h1>{title}</h1><p className="muted">{subtitle}</p></div><div className="actions">{actions}</div></div>;
 }
 function AuthScreen({ onLogin }) {
-  const [mode,setMode]=useState("login"), [name,setName]=useState(""), [studentId,setStudentId]=useState(""), [email,setEmail]=useState(""), [password,setPassword]=useState(""), [confirm,setConfirm]=useState("");
-  const [error,setError]=useState(""), [notice,setNotice]=useState(""), [busy,setBusy]=useState(false);
+  const [studentId,setStudentId]=useState(""), [password,setPassword]=useState("");
+  const [error,setError]=useState(""), [busy,setBusy]=useState(false);
   const navigate=useNavigate();
   async function submit(e) {
-    e.preventDefault();setError("");setNotice("");setBusy(true);
+    e.preventDefault(); setError(""); setBusy(true);
     try {
-      if(mode==="signup") {
-        if(password!==confirm) throw new Error("Passwords do not match.");
-        const result=await api.signup({name,student_id:studentId,email,password});
-        setNotice(result.message || "Account created. Please sign in.");setMode("login");setPassword("");setConfirm("");
-      } else {
-        const result=await api.login({student_id:studentId,password});
-        const auth={token:result.token,user:result.user};saveAuth(auth);onLogin(result.user);navigate("/",{replace:true});
-      }
-    } catch(err){setError(err.message);} finally{setBusy(false);}
+      const result=await api.login({student_id:studentId.trim(),password});
+      const auth={token:result.token,user:result.user}; saveAuth(auth); onLogin(result.user); navigate("/",{replace:true});
+    } catch(err) { setError(err.message); }
+    finally { setBusy(false); }
   }
   return <div className="auth-screen">
     <section className="auth-hero"><Link to="/login" className="brand brand-light"><span className="brand-mark">L</span><span>LEMS<small>LAB EQUIPMENT MANAGEMENT SYSTEM</small></span></Link>
       <div className="hero-copy"><p className="eyebrow light">SMARTER LAB OPERATIONS</p><h1>Every instrument.<br/>Accounted for.</h1><p>Track lab equipment availability, checkout activity and returns from one workspace designed for your lab.</p><div className="hero-detail"><b>01</b><span><strong>Live availability</strong><small>Know what is ready to use.</small></span></div><div className="hero-detail"><b>02</b><span><strong>Clear accountability</strong><small>Checkout and return history in one place.</small></span></div></div>
       <small className="hero-foot">ECE · LAB EQUIPMENT MANAGEMENT SYSTEM</small>
     </section>
-    <section className="auth-panel"><div className="auth-box"><div className="auth-mobile-brand"><span className="brand-mark">L</span><b>LEMS</b></div><p className="eyebrow">{mode==="login"?"WELCOME BACK":"GET STARTED"}</p><h2>{mode==="login"?"Sign in to LEMS":"Create student account"}</h2><p className="muted">{mode==="login"?"Use your registered student ID and password.":"New registrations receive student access only."}</p>
-      <Alert tone="error">{error}</Alert><Alert tone="success">{notice}</Alert><form className="stack" onSubmit={submit}>
-      {mode==="signup"&&<><Field label="Full name" value={name} onChange={e=>setName(e.target.value)} autoComplete="name" required/><Field label="Email address" type="email" value={email} onChange={e=>setEmail(e.target.value)} autoComplete="email" required/></>}
+    <section className="auth-panel"><div className="auth-box"><div className="auth-mobile-brand"><span className="brand-mark">L</span><b>LEMS</b></div><p className="eyebrow">WELCOME BACK</p><h2>Sign in to LEMS</h2><p className="muted">Use the student ID and initial password provided by your lab administrator.</p>
+      <Alert tone="error">{error}</Alert><form className="stack" onSubmit={submit}>
       <Field label="Student ID" value={studentId} onChange={e=>setStudentId(e.target.value)} autoComplete="username" required/>
-      <Field label="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} autoComplete={mode==="login"?"current-password":"new-password"} minLength={8} maxLength={128} required/>
-      {mode==="signup"&&<Field label="Confirm password" type="password" value={confirm} onChange={e=>setConfirm(e.target.value)} minLength={8} maxLength={128} required/>}
-      <Button type="submit" busy={busy} className="full">{mode==="login"?"Sign in →":"Create account →"}</Button></form>
-      {mode==="login"&&<Link className="text-link forgot" to="/forgot-password">Forgot password?</Link>}
-      <p className="switch">{mode==="login"?"New to LEMS?":"Already registered?"} <button onClick={()=>{setMode(mode==="login"?"signup":"login");setError("");setNotice("");}}>{mode==="login"?"Create an account":"Sign in"}</button></p>
-      <p className="privacy">Access is checked by the server. Keep your sign-in details private.</p>
+      <Field label="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} autoComplete="current-password" required/>
+      <Button type="submit" busy={busy} className="full">Sign in →</Button></form>
+      <Link className="text-link forgot" to="/forgot-password">Forgot password?</Link>
+      <p className="privacy">Student accounts are created by the lab administrator. Contact your administrator if you need access.</p>
     </div></section>
   </div>;
 }
