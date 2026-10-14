@@ -203,32 +203,34 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
     });
 });
 
-// Sign Up / Registration API
+// Public self-registration is disabled. Student accounts are created by administrators only.
 app.post("/api/signup", loginLimiter, (req, res) => {
+    return res.status(403).json({ message: "Student self-registration is disabled. Contact your lab administrator." });
+});
+
+// Administrator-created student accounts.
+app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (req, res) => {
     const { name, student_id, email, password } = req.body || {};
-    if (!name || !student_id || !email || !password) return res.status(400).json({ message: "Name, student ID, email, and password are required." });
-    if (String(password).length < 8 || String(password).length > 128) return res.status(400).json({ message: "Password must be between 8 and 128 characters." });
+    if (!name || !student_id || !email || !password) return res.status(400).json({ message: "Name, student ID, email, and initial password are required." });
     const cleanName = String(name).trim();
     const cleanStudentId = String(student_id).trim();
     const cleanEmail = String(email).trim().toLowerCase();
-    if (!cleanName || !cleanStudentId || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return res.status(400).json({ message: "Enter a valid name, student ID, and email." });
+    const cleanPassword = String(password);
+    if (!cleanName || cleanName.length > 100 || !cleanStudentId || cleanStudentId.length > 50 || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(cleanEmail)) return res.status(400).json({ message: "Enter a valid name, student ID, and email." });
+    if (cleanPassword.length < 8 || cleanPassword.length > 128) return res.status(400).json({ message: "Initial password must be 8–128 characters." });
     db.query("SELECT user_id FROM users WHERE student_id = ? OR email = ?", [cleanStudentId, cleanEmail], (err, rows) => {
-        if (err) {
-            console.error("Signup check failed:", err.message);
-            return res.status(500).json({ message: "Could not create the account right now." });
-        }
-        if (rows.length) return res.status(409).json({ message: "An account with that student ID or email already exists." });
-        bcrypt.hash(String(password), 12, (hashError, passwordHash) => {
+        if (err) { console.error("Student account check failed:", err.message); return res.status(500).json({ message: "Could not create the student account." }); }
+        if (rows.length) return res.status(409).json({ message: "That student ID or email is already registered." });
+        bcrypt.hash(cleanPassword, 12, (hashError, passwordHash) => {
             if (hashError) return res.status(500).json({ message: "Could not secure the password." });
-            db.query("INSERT INTO users (name, student_id, email, password, role) VALUES (?, ?, ?, ?, 'student')",
-                [cleanName, cleanStudentId, cleanEmail, passwordHash], (insertError) => {
-                    if (insertError) {
-                        if (insertError.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "An account with that student ID or email already exists." });
-                        console.error("Signup insert failed:", insertError.message);
-                        return res.status(500).json({ message: "Could not create the account right now." });
-                    }
-                    res.status(201).json({ message: "Account created successfully. You can now sign in." });
-                });
+            db.query("INSERT INTO users (name, student_id, email, password, role) VALUES (?, ?, ?, ?, 'student')", [cleanName, cleanStudentId, cleanEmail, passwordHash], (insertError, result) => {
+                if (insertError) {
+                    if (insertError.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "That student ID or email is already registered." });
+                    console.error("Student account insert failed:", insertError.message);
+                    return res.status(500).json({ message: "Could not create the student account." });
+                }
+                return res.status(201).json({ message: "Student account created successfully.", student: { user_id: result.insertId, name: cleanName, student_id: cleanStudentId, email: cleanEmail, role: "student" } });
+            });
         });
     });
 });
