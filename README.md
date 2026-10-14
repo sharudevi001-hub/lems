@@ -21,7 +21,7 @@ Configure `NODE_ENV`, `JWT_SECRET`, `MYSQLHOST`, `MYSQLPORT`, `MYSQLUSER`, `MYSQ
 The React client is configured for Capacitor, which packages the same app UI for Android. Its API helper reads `VITE_API_BASE_URL` at build time.
 
 1. For the Railway-hosted website, use `VITE_API_BASE_URL=/api` (same-origin API).
-2. For an Android/Capacitor build, set `VITE_API_BASE_URL=https://lems-app-production.up.railway.app/api` in `frontend-react/.env.production` before building. Do not use `localhost` for a phone build; on a phone, localhost refers to the phone itself.
+2. For an Android/Capacitor build, copy `frontend-react/.env.production.example` to `frontend-react/.env.production`. It points to `https://lems-app-production.up.railway.app/api`. Do not use `localhost` for a phone build; on a phone, localhost refers to the phone itself.
 3. From the repository root, run `npm run build`.
 4. In `frontend-react`, run `npx cap sync android`, then open the Android project with `npx cap open android`.
 5. Test login, equipment listing, checkout, return, and admin-only actions on a physical phone before releasing an APK.
