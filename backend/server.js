@@ -216,7 +216,7 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
     const cleanStudentId = String(student_id).trim();
     const cleanEmail = String(email).trim().toLowerCase();
     const cleanPassword = String(password);
-    if (!cleanName || cleanName.length > 100 || !cleanStudentId || cleanStudentId.length > 50 || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(cleanEmail)) return res.status(400).json({ message: "Enter a valid name, student ID, and email." });
+    if (!cleanName || cleanName.length > 100 || !cleanStudentId || cleanStudentId.length > 50 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return res.status(400).json({ message: "Enter a valid name, student ID, and email." });
     if (cleanPassword.length < 8 || cleanPassword.length > 128) return res.status(400).json({ message: "Initial password must be 8–128 characters." });
     db.query("SELECT user_id FROM users WHERE student_id = ? OR email = ?", [cleanStudentId, cleanEmail], (err, rows) => {
         if (err) { console.error("Student account check failed:", err.message); return res.status(500).json({ message: "Could not create the student account." }); }
