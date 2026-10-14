@@ -271,3 +271,10 @@ tbody tr:hover { background: #edf2f8; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; }
 }
+/* Partial-return workflow */
+.return-select-list{display:grid;gap:10px;margin-top:14px}
+.return-select-item{display:flex;align-items:flex-start;gap:12px;padding:12px 14px;border:1px solid var(--border,#dce3ea);border-radius:12px;cursor:pointer}
+.return-select-item input{margin-top:4px;accent-color:var(--primary,#2563eb)}
+.return-select-item span{display:grid;gap:4px}
+.return-select-item small{color:var(--muted,#64748b);font-size:.85rem}
+.return-barcode{display:inline-block;margin:10px 0;padding:14px 18px;border:2px dashed var(--primary,#2563eb);border-radius:10px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:clamp(1.15rem,3vw,1.8rem);font-weight:800;letter-spacing:.08em;overflow-wrap:anywhere}
