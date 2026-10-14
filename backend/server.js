@@ -568,6 +568,10 @@ app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, 
 
 // Checkout equipment API
 app.post("/api/checkout", authenticateToken, (req, res) => {
+    if (String(req.user.role || "").toLowerCase() !== "admin") {
+        return res.status(403).json({ message: "Student checkout must use the QR checkout request and admin issue workflow." });
+    }
+
     const { equipment_id } = req.body || {};
     const user_id = req.user.user_id;
 
@@ -745,6 +749,10 @@ app.post("/api/admin/return-qr/confirm", authenticateToken, requireAdmin, (req, 
 
 // Return equipment API
 app.post("/api/return", authenticateToken, (req, res) => {
+    if (String(req.user.role || "").toLowerCase() !== "admin") {
+        return res.status(403).json({ message: "Student returns must use the return QR and admin confirmation workflow." });
+    }
+
     const { equipment_id } = req.body || {};
     const currentUserId = req.user.user_id;
     const isAdministrator = String(req.user.role || "").toLowerCase() === "admin";
