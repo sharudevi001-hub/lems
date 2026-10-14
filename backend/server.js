@@ -223,7 +223,7 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
         if (rows.length) return res.status(409).json({ message: "That student ID or email is already registered." });
         bcrypt.hash(cleanPassword, 12, (hashError, passwordHash) => {
             if (hashError) return res.status(500).json({ message: "Could not secure the password." });
-            db.query("INSERT INTO users (name, student_id, email, password, role) VALUES (?, ?, ?, ?, 'student')", [cleanName, cleanStudentId, cleanEmail, passwordHash], (insertError, result) => {
+            db.query("INSERT INTO users (name, student_id, email, password, role, must_change_password) VALUES (?, ?, ?, ?, 'student', 1)", [cleanName, cleanStudentId, cleanEmail, passwordHash], (insertError, result) => {
                 if (insertError) {
                     if (insertError.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "That student ID or email is already registered." });
                     console.error("Student account insert failed:", insertError.message);
@@ -238,7 +238,7 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
 app.post("/api/login", loginLimiter, (req, res) => {
     const { student_id, password } = req.body || {};
     if (!student_id || !password) return res.status(400).json({ message: "Student ID and password are required." });
-    db.query("SELECT user_id, name, student_id, email, role, password FROM users WHERE student_id = ? LIMIT 1",
+    db.query("SELECT user_id, name, student_id, email, role, password, COALESCE(must_change_password, 0) AS must_change_password FROM users WHERE student_id = ? LIMIT 1",
         [String(student_id).trim()], async (err, rows) => {
             if (err) {
                 console.error("Login database error:", err.message);
@@ -270,7 +270,8 @@ app.post("/api/login", loginLimiter, (req, res) => {
                 name: row.name,
                 student_id: row.student_id,
                 email: row.email,
-                role: String(row.role || "student").toLowerCase()
+                role: String(row.role || "student").toLowerCase(),
+                must_change_password: Boolean(row.must_change_password)
             };
             const token = jwt.sign(
                 { user_id: user.user_id, student_id: user.student_id, role: user.role },
@@ -279,6 +280,31 @@ app.post("/api/login", loginLimiter, (req, res) => {
             );
             res.json({ message: "Login successful", user, token });
         });
+});
+
+// Mandatory initial password change for administrator-created student accounts.
+app.post("/api/change-password", authenticateToken, loginLimiter, (req, res) => {
+    const currentPassword = String((req.body || {}).current_password || "");
+    const newPassword = String((req.body || {}).new_password || "");
+    if (!currentPassword || newPassword.length < 8 || newPassword.length > 128) {
+        return res.status(400).json({ message: "Enter your current password and a new password of 8–128 characters." });
+    }
+    db.query("SELECT user_id, password FROM users WHERE user_id = ? LIMIT 1", [req.user.user_id], async (err, rows) => {
+        if (err || !rows.length) return res.status(500).json({ message: "Could not verify your account." });
+        const stored = String(rows[0].password || "");
+        let matches = false;
+        try { matches = /^\$2[aby]\$/.test(stored) ? await bcrypt.compare(currentPassword, stored) : stored === currentPassword; }
+        catch { return res.status(500).json({ message: "Could not verify your password." }); }
+        if (!matches) return res.status(401).json({ message: "Current password is incorrect." });
+        if (currentPassword === newPassword) return res.status(400).json({ message: "Choose a password different from your initial password." });
+        try {
+            const hash = await bcrypt.hash(newPassword, 12);
+            db.query("UPDATE users SET password = ?, must_change_password = 0 WHERE user_id = ?", [hash, req.user.user_id], updateError => {
+                if (updateError) return res.status(500).json({ message: "Could not update your password." });
+                return res.json({ message: "Password changed successfully. Please sign in again." });
+            });
+        } catch { return res.status(500).json({ message: "Could not secure your new password." }); }
+    });
 });
 
 // Forgot Password API - Generates reset link & sends real email
