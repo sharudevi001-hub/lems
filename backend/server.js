@@ -468,6 +468,104 @@ app.put("/api/complaints/:id/resolve", authenticateToken, requireAdmin, (req, re
     });
 });
 
+// Multi-item checkout QR workflow. Run backend/migrations/20261015_checkout_qr.sql first.
+const hashQrToken = value => crypto.createHash("sha256").update(String(value)).digest("hex");
+
+app.post("/api/checkout-requests", authenticateToken, (req, res) => {
+    const rawIds = req.body && req.body.equipment_ids;
+    if (!Array.isArray(rawIds) || rawIds.length < 1 || rawIds.length > 25) {
+        return res.status(400).json({ message: "Select between 1 and 25 equipment items." });
+    }
+    const ids = [...new Set(rawIds.map(Number))];
+    if (ids.length !== rawIds.length || ids.some(id => !Number.isSafeInteger(id) || id <= 0)) {
+        return res.status(400).json({ message: "Equipment selection contains invalid or duplicate IDs." });
+    }
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = hashQrToken(token);
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Checkout request is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start checkout request." }); }
+            connection.query("SELECT equipment_id, name, equipment_code, status, COALESCE(available_quantity, 1) AS available_quantity FROM equipment WHERE equipment_id IN (?) FOR UPDATE", [ids], (selectError, rows) => {
+                if (selectError || rows.length !== ids.length) {
+                    return connection.rollback(() => { connection.release(); res.status(selectError ? 500 : 400).json({ message: selectError ? "Could not validate equipment." : "One or more selected items no longer exist." }); });
+                }
+                const unavailable = rows.filter(item => !["AVAILABLE"].includes(String(item.status || "").toUpperCase()) || Number(item.available_quantity) < 1);
+                if (unavailable.length) {
+                    return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Some selected equipment is unavailable. Refresh the inventory and try again.", unavailable: unavailable.map(item => item.equipment_code) }); });
+                }
+                connection.query("INSERT INTO checkout_requests (user_id, token_hash, status) VALUES (?, ?, 'PENDING')", [req.user.user_id, tokenHash], (insertError, result) => {
+                    if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create checkout request. Apply the QR migration and try again." }); });
+                    const values = ids.map(id => [result.insertId, id]);
+                    connection.query("INSERT INTO checkout_request_items (request_id, equipment_id) VALUES ?", [values], itemError => {
+                        if (itemError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not save the selected items." }); });
+                        connection.commit(commitError => {
+                            connection.release();
+                            if (commitError) return res.status(500).json({ message: "Could not save checkout request." });
+                            res.status(201).json({ message: "Checkout QR request created. Show this token to the lab administrator.", request_id: result.insertId, token, status: "PENDING", items: rows.map(item => ({ equipment_id: item.equipment_id, equipment_code: item.equipment_code, name: item.name })) });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
+app.post("/api/admin/checkout-requests/scan", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid checkout QR token is required." });
+    db.query("SELECT r.request_id, r.status, r.created_at, u.user_id, u.name AS student_name, u.student_id FROM checkout_requests r JOIN users u ON u.user_id = r.user_id WHERE r.token_hash = ? LIMIT 1", [hashQrToken(token)], (err, requests) => {
+        if (err) return res.status(500).json({ message: "Could not verify QR request. Ensure the QR migration is applied." });
+        if (!requests.length) return res.status(404).json({ message: "QR token not found." });
+        const request = requests[0];
+        if (request.status !== "PENDING") return res.status(409).json({ message: "This QR request has already been used or cancelled.", status: request.status });
+        db.query("SELECT e.equipment_id, e.equipment_code, e.name, e.status, COALESCE(e.available_quantity, 1) AS available_quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? ORDER BY i.request_item_id", [request.request_id], (itemError, items) => {
+            if (itemError) return res.status(500).json({ message: "Could not load requested equipment." });
+            res.json({ request: { request_id: request.request_id, status: request.status, created_at: request.created_at }, student: { user_id: request.user_id, name: request.student_name, student_id: request.student_id }, items });
+        });
+    });
+});
+
+app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid checkout QR token is required." });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Issue operation is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start issue operation." }); }
+            connection.query("SELECT request_id, user_id, status FROM checkout_requests WHERE token_hash = ? FOR UPDATE", [hashQrToken(token)], (requestError, requests) => {
+                if (requestError || !requests.length) return connection.rollback(() => { connection.release(); res.status(requestError ? 500 : 404).json({ message: requestError ? "Could not verify checkout request." : "QR token not found." }); });
+                const request = requests[0];
+                if (request.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This QR has already been used or cancelled.", status: request.status }); });
+                connection.query("SELECT e.equipment_id, e.equipment_code, e.status, COALESCE(e.available_quantity, 1) AS available_quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? FOR UPDATE", [request.request_id], (itemsError, items) => {
+                    if (itemsError || !items.length) return connection.rollback(() => { connection.release(); res.status(itemsError ? 500 : 400).json({ message: "No equipment found in this checkout request." }); });
+                    if (items.some(item => String(item.status).toUpperCase() !== "AVAILABLE" || Number(item.available_quantity) < 1)) {
+                        return connection.rollback(() => { connection.release(); res.status(409).json({ message: "At least one item is now unavailable. No equipment was issued; create a new request after refreshing inventory." }); });
+                    }
+                    connection.query("SELECT equipment_id FROM transactions WHERE user_id = ? AND status = 'ACTIVE' AND equipment_id IN (?)", [request.user_id, items.map(item => item.equipment_id)], (activeError, activeRows) => {
+                        if (activeError || activeRows.length) return connection.rollback(() => { connection.release(); res.status(activeError ? 500 : 409).json({ message: activeError ? "Could not check existing loans." : "Student already has an active loan for one or more selected items." }); });
+                        connection.query("INSERT INTO transactions (user_id, equipment_id, status) VALUES ?", [items.map(item => [request.user_id, item.equipment_id, "ACTIVE"])], insertError => {
+                            if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); });
+                            const ids = items.map(item => item.equipment_id);
+                            connection.query("UPDATE equipment SET available_quantity = GREATEST(0, COALESCE(available_quantity, 1) - 1), status = CASE WHEN COALESCE(available_quantity, 1) - 1 <= 0 THEN 'OUT_OF_STOCK' ELSE 'AVAILABLE' END WHERE equipment_id IN (?)", [ids], updateError => {
+                                if (updateError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not update inventory." }); });
+                                connection.query("UPDATE checkout_requests SET status = 'ISSUED', issued_at = NOW(), issued_by = ? WHERE request_id = ? AND status = 'PENDING'", [req.user.user_id, request.request_id], (markError, result) => {
+                                    if (markError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Checkout request state changed. No issue was saved." }); });
+                                    connection.commit(commitError => {
+                                        connection.release();
+                                        if (commitError) return res.status(500).json({ message: "Issue could not be committed. Check transaction history before retrying." });
+                                        res.json({ message: "Equipment issued successfully.", request_id: request.request_id, equipment_codes: items.map(item => item.equipment_code) });
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
 // Checkout equipment API
 app.post("/api/checkout", authenticateToken, (req, res) => {
     const { equipment_id } = req.body || {};
