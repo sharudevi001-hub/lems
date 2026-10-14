@@ -718,6 +718,196 @@ app.post("/api/kiosk/scan", verifyKioskKey, (req, res) => {
     });
 });
 
+
+// Partial-return workflow: students request selected active transaction IDs; only admins confirm physical handover.
+app.post("/api/return-batches", authenticateToken, (req, res) => {
+    const userId = Number(req.user.user_id);
+    const ids = Array.isArray((req.body || {}).transaction_ids)
+        ? [...new Set(req.body.transaction_ids.map(Number).filter(Number.isInteger))]
+        : [];
+    if (!Number.isInteger(userId) || userId <= 0 || ids.length === 0 || ids.some(id => id <= 0)) {
+        return res.status(400).json({ message: "Select at least one valid active item to return." });
+    }
+    const barcode = "RET-" + crypto.randomBytes(9).toString("hex").toUpperCase();
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not start a return request." });
+        connection.beginTransaction(beginError => {
+            if (beginError) {
+                connection.release();
+                return res.status(500).json({ message: "Could not start a return request." });
+            }
+            const placeholders = ids.map(() => "?").join(",");
+            connection.query(
+                "SELECT t.transaction_id FROM transactions t WHERE t.user_id = ? AND t.status = 'ACTIVE' AND t.transaction_id IN (" + placeholders + ") FOR UPDATE",
+                [userId, ...ids],
+                (selectError, rows) => {
+                    if (selectError || rows.length !== ids.length) {
+                        return connection.rollback(() => {
+                            connection.release();
+                            res.status(selectError ? 500 : 409).json({ message: selectError ? "Could not validate selected items." : "One or more selected items are no longer active checkouts." });
+                        });
+                    }
+                    connection.query(
+                        "SELECT rbi.transaction_id FROM return_batch_items rbi JOIN return_batches rb ON rb.return_batch_id = rbi.return_batch_id WHERE rb.status = 'PENDING' AND rbi.transaction_id IN (" + placeholders + ")",
+                        ids,
+                        (reservedError, reserved) => {
+                            if (reservedError || reserved.length) {
+                                return connection.rollback(() => {
+                                    connection.release();
+                                    res.status(reservedError ? 500 : 409).json({ message: reservedError ? "Could not check existing return requests." : "One or more selected items are already awaiting admin confirmation." });
+                                });
+                            }
+                            connection.query(
+                                "INSERT INTO return_batches (barcode, user_id, status, created_at) VALUES (?, ?, 'PENDING', NOW())",
+                                [barcode, userId],
+                                (batchError, batchResult) => {
+                                    if (batchError) {
+                                        return connection.rollback(() => {
+                                            connection.release();
+                                            res.status(500).json({ message: "Could not create the return request." });
+                                        });
+                                    }
+                                    const values = ids.map(id => [batchResult.insertId, id]);
+                                    connection.query(
+                                        "INSERT INTO return_batch_items (return_batch_id, transaction_id) VALUES ?",
+                                        [values],
+                                        itemError => {
+                                            if (itemError) {
+                                                return connection.rollback(() => {
+                                                    connection.release();
+                                                    res.status(500).json({ message: "Could not save selected return items." });
+                                                });
+                                            }
+                                            connection.commit(commitError => {
+                                                connection.release();
+                                                if (commitError) return res.status(500).json({ message: "Could not save the return request." });
+                                                res.status(201).json({ message: "Return request created. Show this barcode to the administrator.", barcode, item_count: ids.length, status: "PENDING" });
+                                            });
+                                        }
+                                    );
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+        });
+    });
+});
+
+app.get("/api/return-batches/mine", authenticateToken, (req, res) => {
+    db.query(
+        "SELECT rb.return_batch_id, rb.barcode, rb.status, rb.created_at, rb.confirmed_at, COUNT(rbi.transaction_id) AS item_count FROM return_batches rb LEFT JOIN return_batch_items rbi ON rbi.return_batch_id = rb.return_batch_id WHERE rb.user_id = ? GROUP BY rb.return_batch_id ORDER BY rb.return_batch_id DESC",
+        [req.user.user_id],
+        (err, rows) => {
+            if (err) {
+                if (err.code === "ER_NO_SUCH_TABLE") return res.status(503).json({ message: "Return workflow database migration has not been applied yet." });
+                return res.status(500).json({ message: "Could not load your return requests." });
+            }
+            res.json(rows);
+        }
+    );
+});
+
+app.get("/api/return-batches/pending", authenticateToken, requireAdmin, (req, res) => {
+    db.query(
+        "SELECT rb.return_batch_id, rb.barcode, rb.user_id, u.name AS student_name, u.student_id, rb.created_at, COUNT(rbi.transaction_id) AS item_count FROM return_batches rb JOIN users u ON u.user_id = rb.user_id JOIN return_batch_items rbi ON rbi.return_batch_id = rb.return_batch_id WHERE rb.status = 'PENDING' GROUP BY rb.return_batch_id ORDER BY rb.created_at ASC",
+        (err, rows) => {
+            if (err) {
+                if (err.code === "ER_NO_SUCH_TABLE") return res.status(503).json({ message: "Return workflow database migration has not been applied yet." });
+                return res.status(500).json({ message: "Could not load pending return requests." });
+            }
+            res.json(rows);
+        }
+    );
+});
+
+app.post("/api/return-batches/:barcode/confirm", authenticateToken, requireAdmin, (req, res) => {
+    const barcode = String(req.params.barcode || "").trim().toUpperCase();
+    if (!/^RET-[A-F0-9]{18}$/.test(barcode)) return res.status(400).json({ message: "Enter a valid return barcode." });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not start return confirmation." });
+        connection.beginTransaction(beginError => {
+            if (beginError) {
+                connection.release();
+                return res.status(500).json({ message: "Could not start return confirmation." });
+            }
+            connection.query("SELECT return_batch_id, user_id, status FROM return_batches WHERE barcode = ? FOR UPDATE", [barcode], (batchError, batches) => {
+                if (batchError || !batches.length || batches[0].status !== "PENDING") {
+                    return connection.rollback(() => {
+                        connection.release();
+                        res.status(batchError ? 500 : 409).json({ message: batchError ? "Could not look up that barcode." : "Barcode not found or this return batch has already been confirmed." });
+                    });
+                }
+                const batch = batches[0];
+                connection.query(
+                    "SELECT t.transaction_id, t.equipment_id FROM return_batch_items rbi JOIN transactions t ON t.transaction_id = rbi.transaction_id WHERE rbi.return_batch_id = ? AND t.user_id = ? AND t.status = 'ACTIVE' FOR UPDATE",
+                    [batch.return_batch_id, batch.user_id],
+                    (itemsError, items) => {
+                        if (itemsError || !items.length) {
+                            return connection.rollback(() => {
+                                connection.release();
+                                res.status(itemsError ? 500 : 409).json({ message: itemsError ? "Could not validate return items." : "No active items remain in this return batch." });
+                            });
+                        }
+                        connection.query(
+                            "UPDATE transactions t JOIN return_batch_items rbi ON rbi.transaction_id = t.transaction_id SET t.status = 'RETURNED', t.return_time = NOW() WHERE rbi.return_batch_id = ? AND t.user_id = ? AND t.status = 'ACTIVE'",
+                            [batch.return_batch_id, batch.user_id],
+                            updateError => {
+                                if (updateError) {
+                                    return connection.rollback(() => {
+                                        connection.release();
+                                        res.status(500).json({ message: "Could not mark items as returned." });
+                                    });
+                                }
+                                const counts = new Map();
+                                for (const item of items) counts.set(Number(item.equipment_id), (counts.get(Number(item.equipment_id)) || 0) + 1);
+                                const entries = [...counts.entries()];
+                                const updateEquipment = index => {
+                                    if (index >= entries.length) {
+                                        return connection.query(
+                                            "UPDATE return_batches SET status = 'CONFIRMED', confirmed_at = NOW(), confirmed_by = ? WHERE return_batch_id = ? AND status = 'PENDING'",
+                                            [req.user.user_id, batch.return_batch_id],
+                                            (confirmError, confirmResult) => {
+                                                if (confirmError || confirmResult.affectedRows !== 1) {
+                                                    return connection.rollback(() => {
+                                                        connection.release();
+                                                        res.status(500).json({ message: "Could not finalize return confirmation." });
+                                                    });
+                                                }
+                                                connection.commit(commitError => {
+                                                    connection.release();
+                                                    if (commitError) return res.status(500).json({ message: "Return confirmation could not be saved." });
+                                                    res.json({ message: "Return confirmed. Selected items have been checked in.", barcode, item_count: items.length, status: "CONFIRMED" });
+                                                });
+                                            }
+                                        );
+                                    }
+                                    const [equipmentId, quantity] = entries[index];
+                                    connection.query(
+                                        "UPDATE equipment SET available_quantity = LEAST(COALESCE(total_quantity, 50), COALESCE(available_quantity, 0) + ?), status = CASE WHEN status IN ('MAINTENANCE', 'LOST') THEN status ELSE 'AVAILABLE' END WHERE equipment_id = ?",
+                                        [quantity, equipmentId],
+                                        (stockError, stockResult) => {
+                                            if (stockError || stockResult.affectedRows !== 1) {
+                                                return connection.rollback(() => {
+                                                    connection.release();
+                                                    res.status(500).json({ message: "Could not update returned equipment stock." });
+                                                });
+                                            }
+                                            updateEquipment(index + 1);
+                                        }
+                                    );
+                                };
+                                updateEquipment(0);
+                            }
+                        );
+                    }
+                );
+            });
+        });
+    });
+});
+
 // Get active checkouts for a specific user
 app.get("/api/transactions/user/:user_id", authenticateToken, (req, res) => {
     const requestedUserId = String(req.params.user_id);
