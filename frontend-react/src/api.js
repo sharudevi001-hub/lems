@@ -33,6 +33,8 @@ export const api = {
   equipment: () => request("equipment"),
   checkout: equipment_id => request("checkout", { method: "POST", body: JSON.stringify({ equipment_id }) }),
   createCheckoutRequest: equipment_ids => request("checkout-requests", { method: "POST", body: JSON.stringify({ equipment_ids }) }),
+  scanCheckoutRequest: token => request("admin/checkout-requests/scan", { method: "POST", body: JSON.stringify({ token }) }),
+  issueCheckoutRequest: token => request("admin/checkout-requests/issue", { method: "POST", body: JSON.stringify({ token }) }),
   returnEquipment: equipment_id => request("return", { method: "POST", body: JSON.stringify({ equipment_id }) }),
   transactions: (id, history = false) => request("transactions/user/" + encodeURIComponent(id) + (history ? "?history=true" : "")),
   allTransactions: () => request("transactions"),
