@@ -29,7 +29,7 @@ export async function request(path, options = {}) {
 }
 export const api = {
   login: data => request("login", { method: "POST", body: JSON.stringify(data) }),
-  signup: data => request("signup", { method: "POST", body: JSON.stringify(data) }),
+  createStudent: data => request("admin/students", { method: "POST", body: JSON.stringify(data) }),
   equipment: () => request("equipment"),
   checkout: equipment_id => request("checkout", { method: "POST", body: JSON.stringify({ equipment_id }) }),
   returnEquipment: equipment_id => request("return", { method: "POST", body: JSON.stringify({ equipment_id }) }),
