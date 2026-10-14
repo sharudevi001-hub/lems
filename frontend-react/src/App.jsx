@@ -143,10 +143,10 @@ function FindStudent() {
  {student&&<><Card title={student.name} subtitle={student.email}><p>Student ID: <b>{student.student_id}</b> · Role: <b>{student.role}</b></p></Card><Card><DataTable rows={transactions} columns={[{key:"transaction_id",label:"ID"},{key:"equipment_code",label:"Code"},{key:"equipment_name",label:"Equipment"},{key:"checkout_time",label:"Checkout",render:r=>formatDate(r.checkout_time)},{key:"return_time",label:"Return",render:r=>formatDate(r.return_time)},{key:"status",label:"Status",render:r=><Status value={r.status}/>} ]}/></Card></>}</>;
 }
 function formatDate(value){if(!value)return "—";const d=new Date(typeof value==="string"?value.replace(" ","T"):value);return Number.isNaN(d.getTime())?"—":d.toLocaleString("en-IN",{dateStyle:"medium",timeStyle:"short",timeZone:"Asia/Kolkata"});}
-function ChangePasswordPage(){
+function ChangePasswordPage({onPasswordChanged}){
  const [currentPassword,setCurrentPassword]=useState(""),[newPassword,setNewPassword]=useState(""),[confirmPassword,setConfirmPassword]=useState(""),[busy,setBusy]=useState(false),[error,setError]=useState("");
  const navigate=useNavigate();
- async function submit(e){e.preventDefault();setError("");if(newPassword!==confirmPassword){setError("New passwords do not match.");return;}setBusy(true);try{await api.changePassword({current_password:currentPassword,new_password:newPassword});saveAuth(null);navigate("/login",{replace:true});}catch(err){setError(err.message);}finally{setBusy(false);}}
+ async function submit(e){e.preventDefault();setError("");if(newPassword!==confirmPassword){setError("New passwords do not match.");return;}setBusy(true);try{await api.changePassword({current_password:currentPassword,new_password:newPassword});saveAuth(null);onPasswordChanged?.();navigate("/login",{replace:true});}catch(err){setError(err.message);}finally{setBusy(false);}}
  return <div className="simple-auth"><Card title="Change your initial password" subtitle="Set a new password before using LEMS."><Alert tone="error">{error}</Alert><form className="stack" onSubmit={submit}><Field label="Initial password" type="password" autoComplete="current-password" value={currentPassword} onChange={e=>setCurrentPassword(e.target.value)} required/><Field label="New password (8–128 characters)" type="password" autoComplete="new-password" minLength={8} maxLength={128} value={newPassword} onChange={e=>setNewPassword(e.target.value)} required/><Field label="Confirm new password" type="password" autoComplete="new-password" value={confirmPassword} onChange={e=>setConfirmPassword(e.target.value)} required/><Button type="submit" busy={busy} className="full">Change password</Button></form></Card></div>;
 }
 function Guard({user,admin=false,children}){if(!user)return <Navigate to="/login" replace/>;if(user.must_change_password)return <Navigate to="/change-password" replace/>;if(admin&&String(user.role).toLowerCase()!=="admin")return <Navigate to="/" replace/>;return children;}
@@ -156,7 +156,7 @@ function App(){
  const logout=()=>{saveAuth(null);setUser(null);navigate("/login",{replace:true});};
  return <Routes>
  <Route path="/login" element={user?<Navigate to={user.must_change_password?"/change-password":"/"} replace/>:<AuthScreen onLogin={setUser}/>}/>
- <Route path="/change-password" element={user?.must_change_password?<ChangePasswordPage/>:<Navigate to={user?"/":"/login"} replace/>}/>
+ <Route path="/change-password" element={user?.must_change_password?<ChangePasswordPage onPasswordChanged={()=>setUser(null)}/>:<Navigate to={user?"/":"/login"} replace/>}/>
  <Route path="/forgot-password" element={<ResetPage forgot/>}/><Route path="/reset-password" element={<ResetPage/>}/>
  <Route path="/" element={<Guard user={user}><Shell user={user} onLogout={logout}><Overview user={user}/></Shell></Guard>}/>
  <Route path="/equipment" element={<Guard user={user}><Shell user={user} onLogout={logout}><EquipmentPage user={user}/></Shell></Guard>}/>
