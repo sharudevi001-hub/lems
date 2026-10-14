@@ -30,6 +30,7 @@ export async function request(path, options = {}) {
 export const api = {
   login: data => request("login", { method: "POST", body: JSON.stringify(data) }),
   createStudent: data => request("admin/students", { method: "POST", body: JSON.stringify(data) }),
+  changePassword: data => request("change-password", { method: "POST", body: JSON.stringify(data) }),
   equipment: () => request("equipment"),
   checkout: equipment_id => request("checkout", { method: "POST", body: JSON.stringify({ equipment_id }) }),
   createCheckoutRequest: equipment_ids => request("checkout-requests", { method: "POST", body: JSON.stringify({ equipment_ids }) }),
