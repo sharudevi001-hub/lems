@@ -672,6 +672,77 @@ app.post("/api/checkout", authenticateToken, (req, res) => {
     );
 });
 
+// Student creates a one-time return QR for an active transaction.
+app.post("/api/return-qr", authenticateToken, (req, res) => {
+    const transactionId = Number((req.body || {}).transaction_id);
+    if (!Number.isInteger(transactionId) || transactionId < 1) return res.status(400).json({ message: "A valid transaction ID is required." });
+    const token = crypto.randomBytes(32).toString("hex");
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Return QR is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start return request." }); }
+            connection.query("SELECT transaction_id, user_id, equipment_id, status FROM transactions WHERE transaction_id = ? FOR UPDATE", [transactionId], (err, rows) => {
+                if (err || !rows.length) return connection.rollback(() => { connection.release(); res.status(err ? 500 : 404).json({ message: err ? "Could not load transaction." : "Transaction not found." }); });
+                const tx = rows[0];
+                if (String(req.user.role).toLowerCase() !== "admin" && Number(tx.user_id) !== Number(req.user.user_id)) return connection.rollback(() => { connection.release(); res.status(403).json({ message: "You can only create a return QR for your own loan." }); });
+                if (tx.status !== "ACTIVE") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This transaction is not active." }); });
+                connection.query("SELECT return_token_id FROM return_qr_tokens WHERE transaction_id = ? AND status = 'PENDING' LIMIT 1", [transactionId], (checkErr, existing) => {
+                    if (checkErr) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not check existing return requests." }); });
+                    if (existing.length) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "A pending return QR already exists for this transaction." }); });
+                    connection.query("INSERT INTO return_qr_tokens (transaction_id, token_hash, status) VALUES (?, ?, 'PENDING')", [transactionId, hashQrToken(token)], insertErr => {
+                        if (insertErr) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create return QR. Ensure the QR migration is applied." }); });
+                        connection.commit(commitErr => { connection.release(); if (commitErr) return res.status(500).json({ message: "Could not save return QR." }); res.status(201).json({ message: "Return QR created. Show it to the lab administrator.", token, transaction_id: transactionId }); });
+                    });
+                });
+            });
+        });
+    });
+});
+
+// Admin scans/validates a return QR; no inventory changes until confirm.
+app.post("/api/admin/return-qr/scan", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid return QR token is required." });
+    db.query("SELECT rt.return_token_id, rt.status AS token_status, t.transaction_id, t.user_id, t.equipment_id, t.status AS transaction_status, u.name AS student_name, u.student_id, e.equipment_code, e.name AS equipment_name FROM return_qr_tokens rt JOIN transactions t ON t.transaction_id = rt.transaction_id JOIN users u ON u.user_id = t.user_id JOIN equipment e ON e.equipment_id = t.equipment_id WHERE rt.token_hash = ? LIMIT 1", [hashQrToken(token)], (err, rows) => {
+        if (err) return res.status(500).json({ message: "Could not verify return QR. Ensure the QR migration is applied." });
+        if (!rows.length) return res.status(404).json({ message: "Return QR token not found." });
+        const row = rows[0];
+        if (row.token_status !== "PENDING" || row.transaction_status !== "ACTIVE") return res.status(409).json({ message: "This return QR has already been used or the loan is no longer active." });
+        res.json({ student: { name: row.student_name, student_id: row.student_id }, item: { transaction_id: row.transaction_id, equipment_id: row.equipment_id, equipment_code: row.equipment_code, name: row.equipment_name }, status: "PENDING" });
+    });
+});
+
+// Admin confirms a scanned return QR. Token use, transaction status and stock update are atomic.
+app.post("/api/admin/return-qr/confirm", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid return QR token is required." });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Return confirmation is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start return confirmation." }); }
+            connection.query("SELECT return_token_id, transaction_id, status FROM return_qr_tokens WHERE token_hash = ? FOR UPDATE", [hashQrToken(token)], (tokenError, tokens) => {
+                if (tokenError || !tokens.length) return connection.rollback(() => { connection.release(); res.status(tokenError ? 500 : 404).json({ message: tokenError ? "Could not validate token." : "Return QR token not found." }); });
+                const qr = tokens[0];
+                if (qr.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This return QR has already been used." }); });
+                connection.query("SELECT transaction_id, equipment_id, status FROM transactions WHERE transaction_id = ? FOR UPDATE", [qr.transaction_id], (txError, txs) => {
+                    if (txError || !txs.length || txs[0].status !== "ACTIVE") return connection.rollback(() => { connection.release(); res.status(txError ? 500 : 409).json({ message: "The loan is no longer active." }); });
+                    const tx = txs[0];
+                    connection.query("UPDATE transactions SET status = 'RETURNED', return_time = NOW() WHERE transaction_id = ? AND status = 'ACTIVE'", [tx.transaction_id], (updateTxError, result) => {
+                        if (updateTxError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return was not recorded." }); });
+                        connection.query("UPDATE equipment SET available_quantity = LEAST(COALESCE(total_quantity, 50), COALESCE(available_quantity, 0) + 1), status = 'AVAILABLE' WHERE equipment_id = ?", [tx.equipment_id], stockError => {
+                            if (stockError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not update available stock." }); });
+                            connection.query("UPDATE return_qr_tokens SET status = 'USED', used_at = NOW(), used_by = ? WHERE return_token_id = ? AND status = 'PENDING'", [req.user.user_id, qr.return_token_id], (markError, markResult) => {
+                                if (markError || markResult.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return QR was already consumed." }); });
+                                connection.commit(commitError => { connection.release(); if (commitError) return res.status(500).json({ message: "Could not commit return. Check transaction history before retrying." }); res.json({ message: "Equipment return confirmed successfully.", transaction_id: tx.transaction_id }); });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
 // Return equipment API
 app.post("/api/return", authenticateToken, (req, res) => {
     const { equipment_id } = req.body || {};
