@@ -32,6 +32,7 @@ export const api = {
   createStudent: data => request("admin/students", { method: "POST", body: JSON.stringify(data) }),
   equipment: () => request("equipment"),
   checkout: equipment_id => request("checkout", { method: "POST", body: JSON.stringify({ equipment_id }) }),
+  createCheckoutRequest: equipment_ids => request("checkout-requests", { method: "POST", body: JSON.stringify({ equipment_ids }) }),
   returnEquipment: equipment_id => request("return", { method: "POST", body: JSON.stringify({ equipment_id }) }),
   transactions: (id, history = false) => request("transactions/user/" + encodeURIComponent(id) + (history ? "?history=true" : "")),
   allTransactions: () => request("transactions"),
