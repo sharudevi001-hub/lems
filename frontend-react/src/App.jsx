@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, getAuth, saveAuth } from "./api.js";
+import QRCode from "qrcode.react";
 
 function Alert({ tone = "info", children }) {
   if (!children) return null;
@@ -88,12 +89,18 @@ function Overview({user}) {
 }
 function EquipmentPage({user}) {
  const [items,setItems]=useState([]),[busy,setBusy]=useState(true),[error,setError]=useState(""),[search,setSearch]=useState(""),[notice,setNotice]=useState("");
+ const [cart,setCart]=useState([]),[requestBusy,setRequestBusy]=useState(false),[checkoutToken,setCheckoutToken]=useState("");
  const load=useCallback(async()=>{setBusy(true);setError("");try{const r=await api.equipment();setItems(Array.isArray(r)?r:[]);}catch(e){setError(e.message);}finally{setBusy(false);}},[]);
  useEffect(()=>{load();},[load]);
- async function action(id,kind){setError("");setNotice("");try{if(kind==="checkout")await api.checkout(id);else await api.returnEquipment(id);setNotice(kind==="checkout"?"Checkout successful.":"Return successful.");await load();}catch(e){setError(e.message);}}
- const filtered=useMemo(()=>items.filter(i=>[i.equipment_code,i.name,i.category,i.status].some(v=>String(v||"").toLowerCase().includes(search.toLowerCase()))),[items,search]);
  const isAdmin=String(user.role||"").toLowerCase()==="admin";
- return <><PageTitle title="Equipment inventory" subtitle="Search instruments and see their current availability." actions={<Button kind="secondary" onClick={load}>↻ Refresh</Button>}/><Alert tone="error">{error}</Alert><Alert tone="success">{notice}</Alert><Card><Field label="Search inventory" placeholder="Code, equipment, category or status…" value={search} onChange={e=>setSearch(e.target.value)}/></Card>{busy?<Loading/>:<Card><DataTable rows={filtered} empty="No equipment matches your search." columns={[{key:"equipment_code",label:"Code"},{key:"name",label:"Equipment"},{key:"category",label:"Category"},{key:"status",label:"Status",render:r=><Status value={r.status}/>},{key:"stock",label:"Available / total",render:r=>(r.available_quantity??"—")+" / "+(r.total_quantity??"—")},{key:"action",label:"Action",render:r=>isAdmin?<Link className="text-link" to={"/admin/equipment/"+r.equipment_id+"/edit"}>Edit →</Link>:String(r.status).toUpperCase()==="AVAILABLE"&&Number(r.available_quantity??1)>0?<Button className="small" onClick={()=>action(r.equipment_id,"checkout")}>Checkout</Button>:<span className="muted">Unavailable</span>}]}/></Card>}</>;
+ const filtered=useMemo(()=>items.filter(i=>[i.equipment_code,i.name,i.category,i.status].some(v=>String(v||"").toLowerCase().includes(search.toLowerCase()))),[items,search]);
+ function toggleCart(item){setCart(old=>old.includes(item.equipment_id)?old.filter(id=>id!==item.equipment_id):[...old,item.equipment_id]);setNotice("");}
+ async function submitCart(){setError("");setNotice("");setRequestBusy(true);try{const result=await api.createCheckoutRequest(cart);setCheckoutToken(result.token);setNotice("Checkout request created. Show this QR to the lab admin for issue confirmation.");setCart([]);}catch(e){setError(e.message);}finally{setRequestBusy(false);}}
+ return <><PageTitle title="Equipment inventory" subtitle="Select multiple available items and send one checkout request." actions={<Button kind="secondary" onClick={load}>↻ Refresh</Button>}/><Alert tone="error">{error}</Alert><Alert tone="success">{notice}</Alert>
+ {checkoutToken&&<Card title="Your checkout QR" subtitle="Keep this QR private. The admin must scan it and confirm issue before equipment is checked out."><div className="stack" style={{alignItems:"center",textAlign:"center"}}><QRCode value={checkoutToken} size={220} level="M" includeMargin/><p className="muted">Request token</p><code style={{overflowWrap:"anywhere"}}>{checkoutToken}</code><Button kind="secondary" onClick={()=>{navigator.clipboard?.writeText(checkoutToken);}}>Copy token</Button><Button kind="secondary" onClick={()=>setCheckoutToken("")}>Close QR</Button></div></Card>}
+ <Card><Field label="Search inventory" placeholder="Code, equipment, category or status…" value={search} onChange={e=>setSearch(e.target.value)}/></Card>
+ {!isAdmin&&<Card title={"Checkout cart ("+cart.length+")"} subtitle="Choose several items, then create a single QR request."><div className="actions"><Button onClick={submitCart} busy={requestBusy} disabled={!cart.length||requestBusy}>Create checkout QR →</Button><Button kind="secondary" onClick={()=>setCart([])} disabled={!cart.length}>Clear cart</Button></div></Card>}
+ {busy?<Loading/>:<Card><DataTable rows={filtered} empty="No equipment matches your search." columns={[{key:"equipment_code",label:"Code"},{key:"name",label:"Equipment"},{key:"category",label:"Category"},{key:"status",label:"Status",render:r=><Status value={r.status}/>},{key:"stock",label:"Available / total",render:r=>(r.available_quantity??"—")+" / "+(r.total_quantity??"—")},{key:"action",label:"Action",render:r=>isAdmin?<Link className="text-link" to={"/admin/equipment/"+r.equipment_id+"/edit"}>Edit →</Link>:String(r.status).toUpperCase()==="AVAILABLE"&&Number(r.available_quantity??1)>0?<Button className="small" kind={cart.includes(r.equipment_id)?"secondary":"primary"} onClick={()=>toggleCart(r)}>{cart.includes(r.equipment_id)?"Remove from cart":"Add to cart"}</Button>:<span className="muted">Unavailable</span>}]}/></Card>}</>;
 }
 function TransactionsPage({user}) {
  const [items,setItems]=useState([]),[busy,setBusy]=useState(true),[error,setError]=useState(""),[search,setSearch]=useState("");
