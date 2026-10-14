@@ -573,7 +573,7 @@ app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, 
                         connection.query("INSERT INTO transactions (user_id, equipment_id, status) VALUES ?", [items.map(item => [request.user_id, item.equipment_id, "ACTIVE"])], insertError => {
                             if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); });
                             const ids = items.map(item => item.equipment_id);
-                            connection.query("UPDATE equipment SET available_quantity = GREATEST(0, COALESCE(available_quantity, 1) - 1), status = CASE WHEN COALESCE(available_quantity, 1) - 1 <= 0 THEN 'OUT_OF_STOCK' ELSE 'AVAILABLE' END WHERE equipment_id IN (?)", [ids], updateError => {
+                            connection.query("UPDATE equipment SET available_quantity = GREATEST(0, COALESCE(available_quantity, 1) - 1), status = CASE WHEN COALESCE(available_quantity, 1) - 1 <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END WHERE equipment_id IN (?)", [ids], updateError => {
                                 if (updateError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not update inventory." }); });
                                 connection.query("UPDATE checkout_requests SET status = 'ISSUED', issued_at = NOW(), issued_by = ? WHERE request_id = ? AND status = 'PENDING'", [req.user.user_id, request.request_id], (markError, result) => {
                                     if (markError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Checkout request state changed. No issue was saved." }); });
@@ -674,7 +674,7 @@ app.post("/api/checkout", authenticateToken, (req, res) => {
                                     db.query(
                                         `UPDATE equipment
                                          SET available_quantity = GREATEST(0, COALESCE(available_quantity, 50) - 1),
-                                             status = CASE WHEN (COALESCE(available_quantity, 50) - 1) <= 0 THEN 'OUT_OF_STOCK' ELSE 'AVAILABLE' END
+                                             status = CASE WHEN (COALESCE(available_quantity, 50) - 1) <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END
                                          WHERE equipment_id = ?`,
                                         [equipment_id],
                                         (err, updateResult) => {
@@ -904,7 +904,7 @@ app.post("/api/kiosk/scan", verifyKioskKey, (req, res) => {
                         db.query(
                             `UPDATE equipment
                              SET available_quantity = GREATEST(0, COALESCE(available_quantity, 50) - 1),
-                                 status = CASE WHEN (COALESCE(available_quantity, 50) - 1) <= 0 THEN 'OUT_OF_STOCK' ELSE 'AVAILABLE' END
+                                 status = CASE WHEN (COALESCE(available_quantity, 50) - 1) <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END
                              WHERE equipment_id = ?`,
                             [equipment.equipment_id],
                             (err) => {
