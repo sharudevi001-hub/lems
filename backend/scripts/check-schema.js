@@ -10,10 +10,13 @@ const config = {
     connectTimeout: 10000
 };
 const required = {
-    users: ["user_id", "name", "student_id", "email", "password", "role", "reset_token", "reset_token_expires"],
+    users: ["user_id", "name", "student_id", "email", "password", "role", "reset_token", "reset_token_expires", "must_change_password"],
     equipment: ["equipment_id", "equipment_code", "name", "category", "rfid_tag", "status", "runtime_hours", "calibration_limit", "total_quantity", "available_quantity"],
     transactions: ["transaction_id", "user_id", "equipment_id", "checkout_time", "return_time", "status"],
-    complaints: ["complaint_id", "user_id", "equipment_id", "issue_description", "status", "created_at"]
+    complaints: ["complaint_id", "user_id", "equipment_id", "issue_description", "status", "created_at"],
+    checkout_requests: ["request_id", "user_id", "token_hash", "status", "created_at", "issued_at", "issued_by"],
+    checkout_request_items: ["request_item_id", "request_id", "equipment_id"],
+    return_qr_tokens: ["return_token_id", "transaction_id", "token_hash", "status", "created_at", "used_at", "used_by"]
 };
 
 async function main() {

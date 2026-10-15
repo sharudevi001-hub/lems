@@ -29,9 +29,16 @@ export async function request(path, options = {}) {
 }
 export const api = {
   login: data => request("login", { method: "POST", body: JSON.stringify(data) }),
-  signup: data => request("signup", { method: "POST", body: JSON.stringify(data) }),
+  createStudent: data => request("admin/students", { method: "POST", body: JSON.stringify(data) }),
+  changePassword: data => request("change-password", { method: "POST", body: JSON.stringify(data) }),
   equipment: () => request("equipment"),
   checkout: equipment_id => request("checkout", { method: "POST", body: JSON.stringify({ equipment_id }) }),
+  createCheckoutRequest: equipment_ids => request("checkout-requests", { method: "POST", body: JSON.stringify({ equipment_ids }) }),
+  scanCheckoutRequest: token => request("admin/checkout-requests/scan", { method: "POST", body: JSON.stringify({ token }) }),
+  issueCheckoutRequest: token => request("admin/checkout-requests/issue", { method: "POST", body: JSON.stringify({ token }) }),
+  createReturnQr: transaction_id => request("return-qr", { method: "POST", body: JSON.stringify({ transaction_id }) }),
+  scanReturnQr: token => request("admin/return-qr/scan", { method: "POST", body: JSON.stringify({ token }) }),
+  confirmReturnQr: token => request("admin/return-qr/confirm", { method: "POST", body: JSON.stringify({ token }) }),
   returnEquipment: equipment_id => request("return", { method: "POST", body: JSON.stringify({ equipment_id }) }),
   transactions: (id, history = false) => request("transactions/user/" + encodeURIComponent(id) + (history ? "?history=true" : "")),
   allTransactions: () => request("transactions"),
