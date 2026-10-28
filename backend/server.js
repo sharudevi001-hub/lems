@@ -803,6 +803,96 @@ app.post("/api/checkout", authenticateToken, (req, res) => {
 });
 
 // Student creates a one-time return QR for an active transaction.
+// Batch return requests support selecting any subset of active unit-level transactions.
+app.post("/api/return-requests", authenticateToken, (req, res) => {
+    const raw = req.body && req.body.transaction_ids;
+    if (!Array.isArray(raw) || raw.length < 1 || raw.length > 25) return res.status(400).json({ message: "Select 1–25 borrowed units to return." });
+    const ids = raw.map(Number);
+    if (ids.some(id => !Number.isSafeInteger(id) || id < 1) || new Set(ids).size !== ids.length) return res.status(400).json({ message: "Return selection contains invalid or duplicate transaction IDs." });
+    const token = crypto.randomBytes(32).toString("hex");
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Return request is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start return request." }); }
+            connection.query("SELECT t.transaction_id,t.user_id,t.equipment_id,t.status,e.equipment_code,e.name AS equipment_name FROM transactions t JOIN equipment e ON e.equipment_id=t.equipment_id WHERE t.transaction_id IN (?) FOR UPDATE", [ids], (selectError, rows) => {
+                if (selectError || rows.length !== ids.length) return connection.rollback(() => { connection.release(); res.status(selectError ? 500 : 404).json({ message: "One or more selected loans could not be found." }); });
+                if (rows.some(row => Number(row.user_id) !== Number(req.user.user_id) && String(req.user.role).toLowerCase() !== "admin")) return connection.rollback(() => { connection.release(); res.status(403).json({ message: "You can only return your own borrowed equipment." }); });
+                if (rows.some(row => row.status !== "ACTIVE")) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "One or more selected units are no longer outstanding." }); });
+                connection.query("INSERT INTO return_sessions (user_id,token_hash,status) VALUES (?,?,'PENDING')", [req.user.user_id, hashQrToken(token)], (insertError, result) => {
+                    if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create return session. Apply the reviewed quantity/return migration first." }); });
+                    connection.query("INSERT INTO return_session_items (return_session_id,transaction_id) VALUES ?", [ids.map(id => [result.insertId,id])], itemError => {
+                        if (itemError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not save return selection." }); });
+                        connection.commit(commitError => { connection.release(); if (commitError) return res.status(500).json({ message: "Could not save return request." }); res.status(201).json({ message: "Return QR created for the selected units.", return_session_id: result.insertId, token, items: rows.map(row => ({ transaction_id: row.transaction_id, equipment_code: row.equipment_code, equipment_name: row.equipment_name })) }); });
+                    });
+                });
+            });
+        });
+    });
+});
+
+app.post("/api/admin/return-requests/scan", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid return QR token is required." });
+    db.query("SELECT s.return_session_id,s.user_id,s.status,s.created_at,u.name AS student_name,u.student_id FROM return_sessions s JOIN users u ON u.user_id=s.user_id WHERE s.token_hash=? LIMIT 1", [hashQrToken(token)], (err, sessions) => {
+        if (err) return res.status(500).json({ message: "Could not verify return QR. Apply the reviewed quantity/return migration first." });
+        if (!sessions.length) return res.status(404).json({ message: "Return QR not found." });
+        const session = sessions[0];
+        if (session.status !== "PENDING") return res.status(409).json({ message: "This return QR has already been processed.", status: session.status });
+        db.query("SELECT i.transaction_id,i.condition_status,t.equipment_id,e.equipment_code,e.name AS equipment_name,t.status AS transaction_status FROM return_session_items i JOIN transactions t ON t.transaction_id=i.transaction_id JOIN equipment e ON e.equipment_id=t.equipment_id WHERE i.return_session_id=? ORDER BY i.return_session_item_id", [session.return_session_id], (itemError, items) => {
+            if (itemError) return res.status(500).json({ message: "Could not load return items." });
+            if (items.some(item => item.transaction_status !== "ACTIVE")) return res.status(409).json({ message: "A selected unit is no longer outstanding. Create a new return request." });
+            res.json({ session: { return_session_id: session.return_session_id, status: session.status, created_at: session.created_at }, student: { user_id: session.user_id, name: session.student_name, student_id: session.student_id }, items });
+        });
+    });
+});
+
+app.post("/api/admin/return-requests/confirm", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid return QR token is required." });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Return confirmation is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start return confirmation." }); }
+            connection.query("SELECT return_session_id,user_id,status FROM return_sessions WHERE token_hash=? FOR UPDATE", [hashQrToken(token)], (sessionError, sessions) => {
+                if (sessionError || !sessions.length) return connection.rollback(() => { connection.release(); res.status(sessionError ? 500 : 404).json({ message: "Return QR not found." }); });
+                const session = sessions[0];
+                if (session.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This return QR has already been processed." }); });
+                connection.query("SELECT i.return_session_item_id,i.transaction_id,COALESCE(i.condition_status,'GOOD') AS condition_status,i.condition_notes,t.equipment_id,t.status AS transaction_status FROM return_session_items i JOIN transactions t ON t.transaction_id=i.transaction_id WHERE i.return_session_id=? FOR UPDATE", [session.return_session_id], (itemsError, items) => {
+                    if (itemsError || !items.length) return connection.rollback(() => { connection.release(); res.status(itemsError ? 500 : 400).json({ message: "No return items were found." }); });
+                    if (items.some(item => item.transaction_status !== "ACTIVE")) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "A selected unit is no longer outstanding." }); });
+                    let index = 0, failed = false;
+                    const next = () => {
+                        if (index >= items.length) {
+                            if (failed) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Return was not saved. No inventory changes were committed." }); });
+                            connection.query("UPDATE return_sessions SET status='CONFIRMED',confirmed_at=NOW(),confirmed_by=? WHERE return_session_id=? AND status='PENDING'", [req.user.user_id,session.return_session_id], (markError, result) => {
+                                if (markError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return session state changed." }); });
+                                connection.commit(commitError => { connection.release(); if (commitError) return res.status(500).json({ message: "Return commit failed. Check transaction history before retrying." }); res.json({ message: "Selected equipment returned successfully.", returned_units: items.length }); });
+                            });
+                            return;
+                        }
+                        const item = items[index++];
+                        connection.query("UPDATE transactions SET status='RETURNED',return_time=NOW() WHERE transaction_id=? AND status='ACTIVE'", [item.transaction_id], (txError, txResult) => {
+                            if (txError || txResult.affectedRows !== 1) { failed = true; return next(); }
+                            const damaged = item.condition_status === "DAMAGED" || item.condition_status === "MISSING_PARTS";
+                            const stockSql = damaged
+                                ? "UPDATE equipment SET status='MAINTENANCE' WHERE equipment_id=?"
+                                : "UPDATE equipment SET available_quantity=LEAST(COALESCE(total_quantity,1),COALESCE(available_quantity,0)+1),status=CASE WHEN COALESCE(available_quantity,0)+1>0 THEN 'AVAILABLE' ELSE status END WHERE equipment_id=?";
+                            connection.query(stockSql, [item.equipment_id], stockError => {
+                                if (stockError) { failed = true; return next(); }
+                                connection.query("INSERT INTO equipment_condition_reports (transaction_id,equipment_id,user_id,return_session_id,condition_status,notes) VALUES (?,?,?,?,?,?)", [item.transaction_id,item.equipment_id,session.user_id,session.return_session_id,item.condition_status,item.condition_notes||null], reportError => {
+                                    if (reportError) { failed = true; return next(); }
+                                    connection.query("UPDATE return_session_items SET processed_at=NOW() WHERE return_session_item_id=?", [item.return_session_item_id], () => next());
+                                });
+                            });
+                        });
+                    };
+                    next();
+                });
+            });
+        });
+    });
+});
+
 app.post("/api/return-qr", authenticateToken, (req, res) => {
     const transactionId = Number((req.body || {}).transaction_id);
     if (!Number.isInteger(transactionId) || transactionId < 1) return res.status(400).json({ message: "A valid transaction ID is required." });
@@ -951,6 +1041,34 @@ app.post("/api/return", authenticateToken, (req, res) => {
 });
 
 // RFID Kiosk Scan API (ESP32 Hardware Integration)
+// Kiosk RFID verification: card UID is an identifier only; active account status is checked in MySQL.
+app.post("/api/kiosk/verify-rfid", verifyKioskKey, (req, res) => {
+    const uid = String((req.body || {}).uid || "").replace(/[\\s:-]/g, "").toUpperCase();
+    if (!/^[0-9A-F]{4,32}$/.test(uid)) return res.status(400).json({ valid: false, message: "Invalid RFID UID format." });
+    db.query("SELECT user_id,name,student_id,role,rfid_uid FROM users WHERE rfid_uid=? LIMIT 1", [uid], (err, rows) => {
+        if (err) return res.status(500).json({ valid: false, message: "Student verification is unavailable." });
+        if (!rows.length || String(rows[0].role || "").toLowerCase() !== "student") return res.status(200).json({ valid: false, message: "Invalid Student Card. Access denied." });
+        res.json({ valid: true, message: "Student verified.", student: { user_id: rows[0].user_id, name: rows[0].name, student_id: rows[0].student_id } });
+    });
+});
+
+// The physical condition buttons can only annotate a pending return selected in the authenticated web flow.
+app.post("/api/kiosk/return-condition", verifyKioskKey, (req, res) => {
+    const uid = String((req.body || {}).uid || "").replace(/[\\s:-]/g, "").toUpperCase();
+    const condition = String((req.body || {}).condition || "").toUpperCase();
+    if (!/^[0-9A-F]{4,32}$/.test(uid) || !["GOOD","DAMAGED","MISSING_PARTS"].includes(condition)) return res.status(400).json({ message: "Valid student UID and return condition are required." });
+    db.query("SELECT user_id FROM users WHERE rfid_uid=? AND LOWER(role)='student' LIMIT 1", [uid], (userError, users) => {
+        if (userError || !users.length) return res.status(userError ? 500 : 403).json({ message: "Student card is not registered." });
+        db.query("SELECT s.return_session_id FROM return_sessions s JOIN return_session_items i ON i.return_session_id=s.return_session_id WHERE s.user_id=? AND s.status='PENDING' AND i.condition_status IS NULL ORDER BY s.created_at ASC,i.return_session_item_id ASC LIMIT 1", [users[0].user_id], (sessionError, sessions) => {
+            if (sessionError || !sessions.length) return res.status(sessionError ? 500 : 409).json({ message: "No pending return item is waiting for condition feedback." });
+            db.query("UPDATE return_session_items SET condition_status=? WHERE return_session_id=? AND condition_status IS NULL ORDER BY return_session_item_id ASC LIMIT 1", [condition,sessions[0].return_session_id], updateError => {
+                if (updateError) return res.status(500).json({ message: "Could not save return condition." });
+                res.json({ message: "Return condition saved.", condition });
+            });
+        });
+    });
+});
+
 app.post("/api/kiosk/scan", verifyKioskKey, (req, res) => {
     const { student_rfid, equipment_rfid } = req.body;
 
