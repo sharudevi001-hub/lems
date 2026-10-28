@@ -329,7 +329,7 @@ app.put("/api/admin/students/:studentId/rfid", authenticateToken, requireAdmin, 
 app.post("/api/login", loginLimiter, (req, res) => {
     const { student_id, password } = req.body || {};
     if (!student_id || !password) return res.status(400).json({ message: "Student ID and password are required." });
-    db.query("SELECT user_id, name, student_id, email, role, password, COALESCE(must_change_password, 0) AS must_change_password FROM users WHERE student_id = ? LIMIT 1",
+    db.query("SELECT user_id, name, student_id, email, role, password, COALESCE(must_change_password, 0) AS must_change_password, COALESCE(account_status,'ACTIVE') AS account_status FROM users WHERE student_id = ? LIMIT 1",
         [String(student_id).trim()], async (err, rows) => {
             if (err) {
                 console.error("Login database error:", err.message);
@@ -346,6 +346,7 @@ app.post("/api/login", loginLimiter, (req, res) => {
                 return res.status(500).json({ message: "Login is temporarily unavailable." });
             }
             if (!matches) return res.status(401).json({ message: "Invalid student ID or password." });
+            if (String(row.account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(403).json({ message: "This account is inactive. Contact the lab administrator." });
             if (!/^\$2[aby]\$/.test(stored)) {
                 try {
                     const upgraded = await bcrypt.hash(String(password), 12);
