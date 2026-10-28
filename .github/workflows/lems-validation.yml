@@ -24,13 +24,13 @@ jobs:
             frontend-react/package-lock.json
       - name: Install backend dependencies
         working-directory: backend
-        run: npm ci
+        run: npm install
       - name: Check backend JavaScript syntax
         working-directory: backend
         run: node --check server.js
       - name: Install frontend dependencies
         working-directory: frontend-react
-        run: npm ci
+        run: npm install
       - name: Build frontend
         working-directory: frontend-react
         run: npm run build
