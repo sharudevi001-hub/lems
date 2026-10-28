@@ -4,6 +4,11 @@
 ALTER TABLE checkout_request_items
   ADD COLUMN quantity INT UNSIGNED NOT NULL DEFAULT 1 AFTER equipment_id;
 
+-- Each equipment record receives an opaque QR token. Existing equipment is backfilled.
+ALTER TABLE equipment ADD COLUMN qr_token CHAR(32) NULL;
+UPDATE equipment SET qr_token = REPLACE(UUID(), '-', '') WHERE qr_token IS NULL OR qr_token = '';
+ALTER TABLE equipment ADD UNIQUE KEY uq_equipment_qr_token (qr_token);
+
 CREATE TABLE IF NOT EXISTS return_sessions (
   return_session_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   user_id INT NOT NULL,
