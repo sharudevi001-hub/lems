@@ -34,6 +34,7 @@ export const api = {
   linkStudentRfid: (studentId, rfid_uid) => request("admin/students/" + encodeURIComponent(studentId) + "/rfid", { method: "PUT", body: JSON.stringify({ rfid_uid }) }),
   changePassword: data => request("change-password", { method: "POST", body: JSON.stringify(data) }),
   equipment: () => request("equipment"),
+  resolveEquipmentQr: token => request("equipment/qr/" + encodeURIComponent(token)),
   checkout: equipment_id => request("checkout", { method: "POST", body: JSON.stringify({ equipment_id }) }),
   createCheckoutRequest: items => request("checkout-requests", { method: "POST", body: JSON.stringify({ items }) }),
   scanCheckoutRequest: token => request("admin/checkout-requests/scan", { method: "POST", body: JSON.stringify({ token }) }),
