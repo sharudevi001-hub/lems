@@ -265,6 +265,23 @@ app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
     });
 });
 
+app.post("/api/admin/students/:studentId/rfid-session", authenticateToken, requireAdmin, (req, res) => {
+    const studentId = Number(req.params.studentId);
+    if (!Number.isSafeInteger(studentId) || studentId < 1) return res.status(400).json({ message: "Invalid student account ID." });
+    db.query("SELECT user_id,COALESCE(account_status,'ACTIVE') AS account_status FROM users WHERE user_id=? AND LOWER(role)='student' LIMIT 1", [studentId], (err, rows) => {
+        if (err) return res.status(500).json({ message: "Could not verify student account. Apply the reviewed registration migration first." });
+        if (!rows.length) return res.status(404).json({ message: "Student account not found." });
+        if (String(rows[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(409).json({ message: "Activate this student account before linking an RFID card." });
+        db.query("UPDATE rfid_registration_sessions SET status='CANCELLED' WHERE status='PENDING' AND expires_at > NOW()", cancelError => {
+            if (cancelError) return res.status(500).json({ message: "RFID registration session table is not ready. Apply the reviewed migration." });
+            db.query("INSERT INTO rfid_registration_sessions (target_user_id,created_by,status,expires_at) VALUES (?,?, 'PENDING', DATE_ADD(NOW(), INTERVAL 3 MINUTE))", [studentId,req.user.user_id], (insertError, result) => {
+                if (insertError) return res.status(500).json({ message: "Could not start RFID registration." });
+                res.status(201).json({ message: "Registration mode is active. Tap the student's card on the ESP32 within 3 minutes.", registration_session_id: result.insertId, expires_in_seconds: 180 });
+            });
+        });
+    });
+});
+
 app.put("/api/admin/students/:studentId/status", authenticateToken, requireAdmin, (req, res) => {
     const studentId = Number(req.params.studentId);
     const status = String((req.body || {}).account_status || "").toUpperCase();
@@ -1069,10 +1086,34 @@ app.post("/api/return", authenticateToken, (req, res) => {
 app.post("/api/kiosk/verify-rfid", verifyKioskKey, (req, res) => {
     const uid = String((req.body || {}).uid || "").replace(/[\\s:-]/g, "").toUpperCase();
     if (!/^[0-9A-F]{4,32}$/.test(uid)) return res.status(400).json({ valid: false, message: "Invalid RFID UID format." });
-    db.query("SELECT * FROM users WHERE rfid_uid=? LIMIT 1", [uid], (err, rows) => {
-        if (err) return res.status(500).json({ valid: false, message: "Student verification is unavailable." });
-        if (!rows.length || String(rows[0].role || "").toLowerCase() !== "student" || String(rows[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(200).json({ valid: false, message: "Invalid or inactive Student Card. Access denied." });
-        res.json({ valid: true, message: "Student verified.", student: { user_id: rows[0].user_id, name: rows[0].name, student_id: rows[0].student_id } });
+    // An admin-created registration session is time-limited and single-use.
+    db.query("SELECT registration_session_id,target_user_id FROM rfid_registration_sessions WHERE status='PENDING' AND expires_at>NOW() ORDER BY registration_session_id DESC LIMIT 1", [], (sessionError, sessions) => {
+        if (sessionError) return res.status(500).json({ valid: false, message: "RFID registration is unavailable. Apply the reviewed migration." });
+        if (sessions.length) {
+            const session = sessions[0];
+            db.getConnection((connectionError, connection) => {
+                if (connectionError) return res.status(500).json({ valid: false, message: "RFID registration is temporarily unavailable." });
+                connection.beginTransaction(beginError => {
+                    if (beginError) { connection.release(); return res.status(500).json({ valid: false, message: "Could not start RFID registration." }); }
+                    connection.query("SELECT registration_session_id,target_user_id FROM rfid_registration_sessions WHERE registration_session_id=? AND status='PENDING' AND expires_at>NOW() FOR UPDATE", [session.registration_session_id], (lockError, active) => {
+                        if (lockError || !active.length) return connection.rollback(() => { connection.release(); res.status(409).json({ valid: false, message: "RFID registration session expired. Start again." }); });
+                        connection.query("UPDATE users SET rfid_uid=? WHERE user_id=? AND LOWER(role)='student' AND COALESCE(account_status,'ACTIVE')='ACTIVE'", [uid,active[0].target_user_id], (linkError, linked) => {
+                            if (linkError || linked.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(linkError?.code === "ER_DUP_ENTRY" ? 409 : 500).json({ valid: false, message: linkError?.code === "ER_DUP_ENTRY" ? "Card Already Registered" : "Could not link RFID card." }); });
+                            connection.query("UPDATE rfid_registration_sessions SET status='USED',used_at=NOW(),used_uid=? WHERE registration_session_id=? AND status='PENDING'", [uid,active[0].registration_session_id], (markError, marked) => {
+                                if (markError || marked.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ valid: false, message: "Registration session was already used." }); });
+                                connection.commit(commitError => { connection.release(); if (commitError) return res.status(500).json({ valid: false, message: "RFID registration could not be committed." }); res.json({ valid: true, registration: true, message: "Student Registered Successfully" }); });
+                            });
+                        });
+                    });
+                });
+            });
+            return;
+        }
+        db.query("SELECT * FROM users WHERE rfid_uid=? LIMIT 1", [uid], (err, rows) => {
+            if (err) return res.status(500).json({ valid: false, message: "Student verification is unavailable." });
+            if (!rows.length || String(rows[0].role || "").toLowerCase() !== "student" || String(rows[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(200).json({ valid: false, message: "Invalid or inactive Student Card. Access denied." });
+            res.json({ valid: true, registration: false, message: "Student verified.", student: { user_id: rows[0].user_id, name: rows[0].name, student_id: rows[0].student_id } });
+        });
     });
 });
 
