@@ -26,6 +26,13 @@ CREATE TABLE IF NOT EXISTS rfid_registration_sessions (
   CONSTRAINT fk_rfid_registration_creator FOREIGN KEY (created_by) REFERENCES users(user_id)
 ) ENGINE=InnoDB;
 
+-- Keep every unit-level transaction traceable to the checkout QR request.
+ALTER TABLE transactions
+  ADD COLUMN checkout_request_id BIGINT UNSIGNED NULL,
+  ADD KEY idx_transactions_checkout_request (checkout_request_id),
+  ADD CONSTRAINT fk_transactions_checkout_request
+    FOREIGN KEY (checkout_request_id) REFERENCES checkout_requests(request_id);
+
 -- Each equipment record receives an opaque QR token. Existing equipment is backfilled.
 ALTER TABLE equipment ADD COLUMN qr_token CHAR(32) NULL;
 UPDATE equipment SET qr_token = REPLACE(UUID(), '-', '') WHERE qr_token IS NULL OR qr_token = '';
