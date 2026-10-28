@@ -12,7 +12,7 @@ const config = {
 const required = {
     users: ["user_id", "name", "student_id", "email", "password", "role", "reset_token", "reset_token_expires", "must_change_password", "rfid_uid", "department", "academic_year", "section", "account_status"],
     equipment: ["equipment_id", "equipment_code", "name", "category", "rfid_tag", "qr_token", "status", "runtime_hours", "calibration_limit", "total_quantity", "available_quantity"],
-    transactions: ["transaction_id", "user_id", "equipment_id", "checkout_time", "return_time", "status"],
+    transactions: ["transaction_id", "user_id", "equipment_id", "checkout_time", "return_time", "status", "checkout_request_id"],
     complaints: ["complaint_id", "user_id", "equipment_id", "issue_description", "status", "created_at"],
     checkout_requests: ["request_id", "user_id", "token_hash", "status", "created_at", "issued_at", "issued_by"],
     checkout_request_items: ["request_item_id", "request_id", "equipment_id", "quantity"],
