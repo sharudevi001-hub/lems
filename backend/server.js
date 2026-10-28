@@ -226,7 +226,7 @@ app.post("/api/signup", loginLimiter, (req, res) => {
 
 // Administrator-created student accounts.
 app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (req, res) => {
-    const { name, student_id, email, password } = req.body || {};
+    const { name, student_id, email, password, department = "", academic_year = "", section = "" } = req.body || {};
     if (!name || !student_id || !email || !password) return res.status(400).json({ message: "Name, student ID, email, and initial password are required." });
     const cleanName = String(name).trim();
     const cleanStudentId = String(student_id).trim();
@@ -239,7 +239,7 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
         if (rows.length) return res.status(409).json({ message: "That student ID or email is already registered." });
         bcrypt.hash(cleanPassword, 12, (hashError, passwordHash) => {
             if (hashError) return res.status(500).json({ message: "Could not secure the password." });
-            db.query("INSERT INTO users (name, student_id, email, password, role, must_change_password) VALUES (?, ?, ?, ?, 'student', 1)", [cleanName, cleanStudentId, cleanEmail, passwordHash], (insertError, result) => {
+            db.query("INSERT INTO users (name, student_id, email, password, department, academic_year, section, account_status, role, must_change_password) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 'student', 1)", [cleanName, cleanStudentId, cleanEmail, passwordHash, String(department).trim() || null, String(academic_year).trim() || null, String(section).trim() || null], (insertError, result) => {
                 if (insertError) {
                     if (insertError.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "That student ID or email is already registered." });
                     console.error("Student account insert failed:", insertError.message);
@@ -254,7 +254,7 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
 // Admin-only student directory and RFID card linking.
 // Uses the existing users.rfid_uid column; no additional table or migration is required.
 app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
-    const sql = "SELECT user_id, name, student_id, email, rfid_uid, " +
+    const sql = "SELECT user_id, name, student_id, email, department, academic_year, section, account_status, rfid_uid, " +
         "CASE WHEN rfid_uid IS NOT NULL AND rfid_uid <> '' THEN 'ACTIVE' ELSE NULL END AS rfid_status, " +
         "created_at FROM users WHERE LOWER(role) = 'student' ORDER BY name ASC";
 
@@ -1059,9 +1059,9 @@ app.post("/api/return", authenticateToken, (req, res) => {
 app.post("/api/kiosk/verify-rfid", verifyKioskKey, (req, res) => {
     const uid = String((req.body || {}).uid || "").replace(/[\\s:-]/g, "").toUpperCase();
     if (!/^[0-9A-F]{4,32}$/.test(uid)) return res.status(400).json({ valid: false, message: "Invalid RFID UID format." });
-    db.query("SELECT user_id,name,student_id,role,rfid_uid FROM users WHERE rfid_uid=? LIMIT 1", [uid], (err, rows) => {
+    db.query("SELECT user_id,name,student_id,role,rfid_uid,COALESCE(account_status,'ACTIVE') AS account_status FROM users WHERE rfid_uid=? LIMIT 1", [uid], (err, rows) => {
         if (err) return res.status(500).json({ valid: false, message: "Student verification is unavailable." });
-        if (!rows.length || String(rows[0].role || "").toLowerCase() !== "student") return res.status(200).json({ valid: false, message: "Invalid Student Card. Access denied." });
+        if (!rows.length || String(rows[0].role || "").toLowerCase() !== "student" || String(rows[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(200).json({ valid: false, message: "Invalid or inactive Student Card. Access denied." });
         res.json({ valid: true, message: "Student verified.", student: { user_id: rows[0].user_id, name: rows[0].name, student_id: rows[0].student_id } });
     });
 });
@@ -1071,7 +1071,7 @@ app.post("/api/kiosk/return-condition", verifyKioskKey, (req, res) => {
     const uid = String((req.body || {}).uid || "").replace(/[\\s:-]/g, "").toUpperCase();
     const condition = String((req.body || {}).condition || "").toUpperCase();
     if (!/^[0-9A-F]{4,32}$/.test(uid) || !["GOOD","DAMAGED","MISSING_PARTS"].includes(condition)) return res.status(400).json({ message: "Valid student UID and return condition are required." });
-    db.query("SELECT user_id FROM users WHERE rfid_uid=? AND LOWER(role)='student' LIMIT 1", [uid], (userError, users) => {
+    db.query("SELECT user_id FROM users WHERE rfid_uid=? AND LOWER(role)='student' AND COALESCE(account_status,'ACTIVE')='ACTIVE' LIMIT 1", [uid], (userError, users) => {
         if (userError || !users.length) return res.status(userError ? 500 : 403).json({ message: "Student card is not registered." });
         db.query("SELECT s.return_session_id FROM return_sessions s JOIN return_session_items i ON i.return_session_id=s.return_session_id WHERE s.user_id=? AND s.status='PENDING' AND i.condition_status IS NULL ORDER BY s.created_at ASC,i.return_session_item_id ASC LIMIT 1", [users[0].user_id], (sessionError, sessions) => {
             if (sessionError || !sessions.length) return res.status(sessionError ? 500 : 409).json({ message: "No pending return item is waiting for condition feedback." });
