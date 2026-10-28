@@ -53,7 +53,7 @@ String uidHex() {
 String postJson(const String &path, const String &payload) {
   if (WiFi.status() != WL_CONNECTED) return "";
   WiFiClientSecure client;
-  client.setInsecure(); // Replace with CA certificate validation before public production use.
+  client.setCACert(ROOT_CA_CERT); // Fail closed unless the server certificate chains to this CA.
   HTTPClient http;
   String url = String(API_BASE_URL) + path;
   if (!http.begin(client, url)) return "";
