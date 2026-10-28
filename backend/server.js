@@ -151,7 +151,8 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         category,
         rfid_tag,
         status,
-        calibration_limit
+        calibration_limit,
+        total_quantity
     } = req.body;
 
     const allowedStatuses = [
@@ -180,7 +181,9 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
             category = ?,
             rfid_tag = ?,
             status = ?,
-            calibration_limit = ?
+            calibration_limit = ?,
+            available_quantity = GREATEST(0, ? - (COALESCE(total_quantity, 1) - COALESCE(available_quantity, 1))),
+            total_quantity = ?
         WHERE equipment_id = ?
     `;
 
@@ -191,6 +194,8 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         rfid_tag,
         status,
         calibration_limit || 500,
+        Number.isSafeInteger(Number(total_quantity)) && Number(total_quantity) >= 1 ? Number(total_quantity) : 1,
+        Number.isSafeInteger(Number(total_quantity)) && Number(total_quantity) >= 1 ? Number(total_quantity) : 1,
         id
     ];
 
@@ -1264,17 +1269,20 @@ app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
     const sql = `
         INSERT INTO equipment
         (equipment_code, name, category, rfid_tag, qr_token,
-         status, runtime_hours, calibration_limit)
-        VALUES (?, ?, ?, ?, ?, 'AVAILABLE', 0, ?)
+         status, runtime_hours, calibration_limit, total_quantity, available_quantity)
+        VALUES (?, ?, ?, ?, ?, 'AVAILABLE', 0, ?, ?, ?)
     `;
 
+    const quantity = Number.isSafeInteger(Number(req.body.total_quantity)) && Number(req.body.total_quantity) >= 1 && Number(req.body.total_quantity) <= 100000 ? Number(req.body.total_quantity) : 1;
     const values = [
         equipment_code,
         name,
         category,
         rfid_tag,
         qrToken,
-        calibration_limit || 500
+        calibration_limit || 500,
+        quantity,
+        quantity
     ];
 
     db.query(sql, values, (error, result) => {
