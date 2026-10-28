@@ -20,6 +20,7 @@ const required = {
     return_session_items: ["return_session_item_id", "return_session_id", "transaction_id", "condition_status", "condition_notes", "processed_at"],
     equipment_condition_reports: ["condition_report_id", "transaction_id", "equipment_id", "user_id", "return_session_id", "condition_status", "notes", "created_at"],
     lems_audit_logs: ["audit_id", "user_id", "action", "entity_type", "entity_id", "details", "created_at"],
+    rfid_registration_sessions: ["registration_session_id", "target_user_id", "created_by", "status", "created_at", "expires_at", "used_at", "used_uid"],
     return_qr_tokens: ["return_token_id", "transaction_id", "token_hash", "status", "created_at", "used_at", "used_by"]
 };
 
