@@ -261,7 +261,7 @@ app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
             console.error("Student directory query failed:", err.message);
             return res.status(500).json({ message: "Could not load students." });
         }
-        return res.json({ students: rows.map(row => ({ ...row, account_status: row.account_status || "ACTIVE", rfid_status: row.rfid_uid ? "ACTIVE" : null })) });
+        return res.json({ students: rows.map(({ password, reset_token, reset_token_expires, ...row }) => ({ ...row, account_status: row.account_status || "ACTIVE", rfid_status: row.rfid_uid ? "ACTIVE" : null })) });
     });
 });
 
