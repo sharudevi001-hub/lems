@@ -1088,7 +1088,14 @@ app.post("/api/kiosk/verify-rfid", verifyKioskKey, (req, res) => {
     if (!/^[0-9A-F]{4,32}$/.test(uid)) return res.status(400).json({ valid: false, message: "Invalid RFID UID format." });
     // An admin-created registration session is time-limited and single-use.
     db.query("SELECT registration_session_id,target_user_id FROM rfid_registration_sessions WHERE status='PENDING' AND expires_at>NOW() ORDER BY registration_session_id DESC LIMIT 1", [], (sessionError, sessions) => {
-        if (sessionError) return res.status(500).json({ valid: false, message: "RFID registration is unavailable. Apply the reviewed migration." });
+        if (sessionError) {
+            // Keep normal RFID verification working on an existing database until the additive migration is applied.
+            return db.query("SELECT * FROM users WHERE rfid_uid=? LIMIT 1", [uid], (verifyError, rows) => {
+                if (verifyError) return res.status(500).json({ valid: false, message: "Student verification is unavailable." });
+                if (!rows.length || String(rows[0].role || "").toLowerCase() !== "student" || String(rows[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(200).json({ valid: false, message: "Invalid or inactive Student Card. Access denied." });
+                res.json({ valid: true, registration: false, message: "Student verified.", student: { user_id: rows[0].user_id, name: rows[0].name, student_id: rows[0].student_id } });
+            });
+        }
         if (sessions.length) {
             const session = sessions[0];
             db.getConnection((connectionError, connection) => {
