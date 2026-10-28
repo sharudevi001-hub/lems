@@ -26,4 +26,4 @@ Do not power MFRC522 from 5V. OLED I2C address is usually 0x3C. Use momentary pu
 
 ## Security and hardware status
 
-The firmware sends UID and condition data over Wi-Fi. The backend must validate the UID against an active account and only accept condition reports tied to an active return session. Before public deployment, replace the temporary TLS bypass in the example with certificate validation. Do not connect a relay/solenoid until the kiosk authorization workflow is tested; the lock is intentionally optional.
+The firmware sends UID and condition data over Wi-Fi. The backend must validate the UID against an active account and only accept condition reports tied to an active return session. The firmware requires CA certificate validation. Replace the placeholder in `secrets.h` with the PEM CA certificate that validates your HTTPS API endpoint or requests will fail closed. Do not connect a relay/solenoid until the kiosk authorization workflow is tested; the lock is intentionally optional.
