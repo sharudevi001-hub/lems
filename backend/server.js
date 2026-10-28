@@ -267,6 +267,17 @@ app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
     });
 });
 
+app.put("/api/admin/students/:studentId/status", authenticateToken, requireAdmin, (req, res) => {
+    const studentId = Number(req.params.studentId);
+    const status = String((req.body || {}).account_status || "").toUpperCase();
+    if (!Number.isSafeInteger(studentId) || studentId < 1 || !["ACTIVE","INACTIVE"].includes(status)) return res.status(400).json({ message: "Valid student ID and ACTIVE/INACTIVE status are required." });
+    db.query("UPDATE users SET account_status=? WHERE user_id=? AND LOWER(role)='student'", [status,studentId], (err,result) => {
+        if (err) return res.status(500).json({ message: "Could not update student status." });
+        if (!result.affectedRows) return res.status(404).json({ message: "Student account not found." });
+        res.json({ message: "Student account status updated.", account_status: status });
+    });
+});
+
 app.put("/api/admin/students/:studentId/rfid", authenticateToken, requireAdmin, (req, res) => {
     const studentId = Number(req.params.studentId);
     const rawUid = String((req.body || {}).rfid_uid || "");
