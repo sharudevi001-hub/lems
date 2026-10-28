@@ -52,6 +52,7 @@ export const api = {
   updateEquipment: (id, data) => request("equipment/" + encodeURIComponent(id), { method: "PUT", body: JSON.stringify(data) }),
   submitComplaint: (equipment_id, issue_description) => request("complaints", { method: "POST", body: JSON.stringify({ equipment_id, issue_description }) }),
   complaints: () => request("complaints"),
+  myComplaints: () => request("my-complaints"),
   resolveComplaint: (id, data) => request("complaints/" + encodeURIComponent(id) + "/resolve", { method: "PUT", body: JSON.stringify(data) }),
   findStudent: id => request("admin/student/" + encodeURIComponent(id)),
   forgotPassword: email => request("forgot-password", { method: "POST", body: JSON.stringify({ email }) }),
