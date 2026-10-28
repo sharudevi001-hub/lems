@@ -1,37 +1,66 @@
-# LEMS Full-Spec Implementation Plan
+# LEMS Full-Spec Implementation and Safe Setup
 
-This plan tracks implementation of the supplied complete LEMS project prompt while preserving the existing Railway production deployment and database.
+This document tracks the supplied project prompt against the existing repository. The existing React/Express/MySQL application is reused; no parallel frontend or duplicate users/equipment tables are introduced.
 
-## Safety rules
-- Work only on `lems/full-spec-staged-implementation`; do not merge or deploy to production without explicit approval.
-- Do not run schema-changing SQL against Railway during implementation.
-- Reuse the existing `users.rfid_uid` column; do not add a duplicate RFID table.
-- Never commit production credentials, JWT secrets, kiosk keys, or raw QR/RFID authorization tokens.
-- A feature is not complete until API/UI behavior and acceptance scenarios are tested.
+## Implemented in the feature branch
 
-## Existing Railway schema confirmed by the project owner
-- `users`: `user_id`, `name`, `student_id`, `email`, `password`, `role`, `reset_token`, `reset_token_expires`, `rfid_uid`, `created_at`, `must_change_password`.
-- `equipment`, `complaints`, `tanscation` and additional checkout/return tables also exist.
-- `users.rfid_uid` is nullable and has a unique index, so it supports one card UID per account and rejects duplicates.
-- The RFID linking routes use this existing column. No RFID schema migration is required for this flow.
+- Admin-only student creation, directory, RFID UID linking, activate/deactivate controls, department/year/section fields, and a 3-minute admin-authorized RFID tap registration session.
+- Login, password reset, first-login password change, and role-protected API routes.
+- Equipment inventory CRUD, stock quantity fields, opaque equipment QR tokens and admin QR labels.
+- Student quantity cart with a single checkout QR. Backend locks stock rows, validates quantities, inserts one transaction row per physical unit, decrements stock in a DB transaction, and prevents reusing a checkout QR.
+- Student selection of individual active unit transactions for partial return using one batch return QR. Backend return confirmation is transactional and updates only selected units.
+- Phone camera QR/barcode scanner where the browser supports the native BarcodeDetector API, with manual token entry fallback.
+- Return condition records, kiosk endpoints for RFID verification and three physical condition buttons, student complaint history, complaint category selector, and expanded admin inventory/student/complaint metrics.
+- ESP32 firmware and wiring documentation for MFRC522, SSD1306 OLED, Wi-Fi and the three feedback buttons.
+- Read-only database schema checker.
 
-## Current implementation on this branch
-- Admin-only student creation and student directory.
-- Admin-only RFID UID linking with input validation and duplicate-UID error handling.
-- Login, change-password/first-login support, forgot/reset password flows.
-- Equipment listing and admin inventory CRUD.
-- Checkout-request QR verification/issue and return-QR verification/confirmation endpoints and admin UI.
-- Complaint listing, submission, and resolution.
-- Transaction history views for admins and students.
+## Important deployment state
 
-## Remaining work before release
-1. Run a clean backend/frontend build and resolve any failures.
-2. Test the student create/list/RFID-link flow against a disposable test database with the same schema; verify duplicate UID rejection.
-3. Verify checkout and return requests against the actual Railway schema using a safe staging database, including quantities, partial returns, damaged-item handling and concurrency.
-4. Complete the hardware kiosk flow (ESP32 DevKit + MFRC522 + SSD1306 OLED + feedback buttons), authenticated backend communication, and setup/wiring documentation.
-5. Confirm phone-camera QR scanning and manual-entry fallback on a real mobile device.
-6. Run the acceptance checklist from the full project prompt and document pass/fail evidence.
-7. Review the final diff and request explicit approval before merging/deploying.
+The frontend production build passed on Railway and the backend started successfully in a successful deployment. That proves the app builds and starts, not that all acceptance tests pass.
 
-## Release status
-This is a staged feature branch, not a production release. No production database migration or deployment is authorized by this plan.
+The additive database migration `backend/migrations/20261028_quantity_partial_returns.sql` is **not automatically executed by the app**. Quantity checkout, equipment QR labels, batch returns, academic profile fields and RFID tap-registration sessions require this migration. Do not claim those workflows are live until the schema check and end-to-end tests pass.
+
+## Apply the migration safely
+
+1. Open MySQL Workbench and connect to the existing Railway MySQL database.
+2. Select the existing `lems_db` schema. Before changing it, use **Server → Data Export** to create a backup.
+3. Inspect `backend/migrations/20261028_quantity_partial_returns.sql`. It is an additive, one-time migration: it adds columns and new tables and backfills existing equipment QR tokens. Do not run it a second time; the ALTER statements are intentionally not repeatable.
+4. Run the migration once against the intended database. Preserve all existing rows; do not drop or recreate tables.
+5. On a machine with the repository checked out, configure backend environment variables for that same database and run:
+
+   ```powershell
+   cd "D:\lems project\backend"
+   npm install
+   npm run db:check
+   ```
+
+6. Resolve any missing-column/table report before using the new workflows. Never paste database passwords, JWT secrets or kiosk keys into GitHub.
+7. Test student creation and RFID registration, checkout of 4 units from stock 25 (expected available stock 21), partial return of 2 units (expected available stock 23 and 2 still outstanding), damaged-item maintenance status, and repeated QR/button submissions.
+8. Only after those checks pass should the deployment be treated as release-ready.
+
+## Local build commands
+
+From the repository root in PowerShell:
+
+```powershell
+cd "D:\lems project\backend"
+npm install
+node --check server.js
+cd ..\frontend-react
+npm install
+npm run build
+```
+
+Use the actual repository folder if it is not `D:\lems project`.
+
+## ESP32 setup
+
+See [HARDWARE_SETUP.md](HARDWARE_SETUP.md). Copy `firmware/esp32-kiosk/secrets.example.h` to a local `secrets.h`, set Wi-Fi/API/kiosk credentials, and replace the placeholder CA certificate with the certificate that validates the HTTPS endpoint. Never commit the real secrets file. Install MFRC522, Adafruit SSD1306 and Adafruit GFX through Arduino Library Manager.
+
+## Remaining acceptance work
+
+- Apply the reviewed migration to a backed-up test/staging database, then run `npm run db:check`.
+- Verify each API against the real schema, including duplicate RFID rejection, stock concurrency, repeat submissions and damaged/missing-part returns.
+- Test camera scanning on an Android phone and fallback entry in a browser without BarcodeDetector.
+- Verify the physical ESP32 buttons, OLED state transitions and Wi-Fi failure behavior on the actual hardware.
+- Confirm production migration and runtime configuration before declaring every acceptance criterion passed.
