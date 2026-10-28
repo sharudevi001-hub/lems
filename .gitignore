@@ -13,3 +13,6 @@ Thumbs.db
 *.jks
 android/.gradle/
 android/local.properties
+
+# Local ESP32 Wi-Fi, API and certificate secrets
+firmware/esp32-kiosk/secrets.h
