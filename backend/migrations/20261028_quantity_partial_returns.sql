@@ -11,6 +11,21 @@ ALTER TABLE users
   ADD COLUMN section VARCHAR(20) NULL,
   ADD COLUMN account_status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE';
 
+CREATE TABLE IF NOT EXISTS rfid_registration_sessions (
+  registration_session_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  target_user_id INT NOT NULL,
+  created_by INT NOT NULL,
+  status ENUM('PENDING','USED','CANCELLED','EXPIRED') NOT NULL DEFAULT 'PENDING',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  expires_at TIMESTAMP NOT NULL,
+  used_at TIMESTAMP NULL,
+  used_uid VARCHAR(32) NULL,
+  PRIMARY KEY (registration_session_id),
+  KEY idx_rfid_registration_pending (status,expires_at),
+  CONSTRAINT fk_rfid_registration_target FOREIGN KEY (target_user_id) REFERENCES users(user_id),
+  CONSTRAINT fk_rfid_registration_creator FOREIGN KEY (created_by) REFERENCES users(user_id)
+) ENGINE=InnoDB;
+
 -- Each equipment record receives an opaque QR token. Existing equipment is backfilled.
 ALTER TABLE equipment ADD COLUMN qr_token CHAR(32) NULL;
 UPDATE equipment SET qr_token = REPLACE(UUID(), '-', '') WHERE qr_token IS NULL OR qr_token = '';
