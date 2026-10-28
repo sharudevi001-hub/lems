@@ -521,6 +521,15 @@ app.post("/api/complaints", authenticateToken, (req, res) => {
     });
 });
 
+// Students can only see their own complaints and statuses.
+app.get("/api/my-complaints", authenticateToken, (req, res) => {
+    const sql = "SELECT c.complaint_id,c.issue_description,c.status,c.created_at,e.equipment_code,e.name AS equipment_name FROM complaints c LEFT JOIN equipment e ON e.equipment_id=c.equipment_id WHERE c.user_id=? ORDER BY c.complaint_id DESC";
+    db.query(sql, [req.user.user_id], (err, rows) => {
+        if (err) return res.status(500).json({ message: "Could not load your complaint history." });
+        res.json(rows);
+    });
+});
+
 // Get All Complaints API (Admin Side)
 app.get("/api/complaints", authenticateToken, requireAdmin, (req, res) => {
     const sql = `
