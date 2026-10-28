@@ -235,6 +235,59 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
     });
 });
 
+// Admin-only student directory and RFID card linking. Requires migration 20261028_student_rfid_cards.sql.
+app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
+    const sql = `
+        SELECT u.user_id, u.name, u.student_id, u.email,
+               c.rfid_uid, c.status AS rfid_status, c.linked_at
+        FROM users u
+        LEFT JOIN student_rfid_cards c ON c.user_id = u.user_id
+        WHERE LOWER(u.role) = 'student'
+        ORDER BY u.name ASC
+    `;
+    db.query(sql, (err, rows) => {
+        if (err) {
+            console.error("Student directory query failed:", err.message);
+            return res.status(500).json({ message: "Could not load students. Confirm the student RFID migration has been applied." });
+        }
+        return res.json({ students: rows });
+    });
+});
+
+app.put("/api/admin/students/:studentId/rfid", authenticateToken, requireAdmin, (req, res) => {
+    const studentId = Number(req.params.studentId);
+    const rawUid = String((req.body || {}).rfid_uid || "");
+    const rfidUid = rawUid.replace(/[\\s:-]/g, "").toUpperCase();
+    if (!Number.isSafeInteger(studentId) || studentId < 1) return res.status(400).json({ message: "Invalid student account ID." });
+    if (!/^[0-9A-F]{4,32}$/.test(rfidUid)) return res.status(400).json({ message: "Enter a valid RFID UID (4–32 hexadecimal characters)." });
+
+    db.query("SELECT user_id FROM users WHERE user_id = ? AND LOWER(role) = 'student' LIMIT 1", [studentId], (studentError, studentRows) => {
+        if (studentError) {
+            console.error("RFID student check failed:", studentError.message);
+            return res.status(500).json({ message: "Could not verify the student account." });
+        }
+        if (!studentRows.length) return res.status(404).json({ message: "Student account not found." });
+
+        const sql = `
+            INSERT INTO student_rfid_cards (user_id, rfid_uid, status, linked_by)
+            VALUES (?, ?, 'ACTIVE', ?)
+            ON DUPLICATE KEY UPDATE
+                rfid_uid = VALUES(rfid_uid),
+                status = 'ACTIVE',
+                linked_by = VALUES(linked_by),
+                linked_at = CURRENT_TIMESTAMP
+        `;
+        db.query(sql, [studentId, rfidUid, Number(req.user.user_id) || null], (linkError) => {
+            if (linkError) {
+                if (linkError.code === "ER_DUP_ENTRY") return res.status(409).json({ message: "This RFID card is already linked to another student." });
+                console.error("RFID card link failed:", linkError.message);
+                return res.status(500).json({ message: "Could not link the RFID card. Confirm the student RFID migration has been applied." });
+            }
+            return res.json({ message: "RFID card linked successfully.", student_id: studentId, rfid_uid: rfidUid, status: "ACTIVE" });
+        });
+    });
+});
+
 app.post("/api/login", loginLimiter, (req, res) => {
     const { student_id, password } = req.body || {};
     if (!student_id || !password) return res.status(400).json({ message: "Student ID and password are required." });
