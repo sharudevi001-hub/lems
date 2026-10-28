@@ -33,6 +33,7 @@ export const api = {
   students: () => request("admin/students"),
   linkStudentRfid: (studentId, rfid_uid) => request("admin/students/" + encodeURIComponent(studentId) + "/rfid", { method: "PUT", body: JSON.stringify({ rfid_uid }) }),
   setStudentStatus: (studentId, account_status) => request("admin/students/" + encodeURIComponent(studentId) + "/status", { method: "PUT", body: JSON.stringify({ account_status }) }),
+  startRfidRegistration: studentId => request("admin/students/" + encodeURIComponent(studentId) + "/rfid-session", { method: "POST" }),
   changePassword: data => request("change-password", { method: "POST", body: JSON.stringify(data) }),
   equipment: () => request("equipment"),
   resolveEquipmentQr: token => request("equipment/qr/" + encodeURIComponent(token)),
