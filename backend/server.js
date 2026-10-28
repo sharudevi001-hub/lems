@@ -562,13 +562,24 @@ app.put("/api/complaints/:id/resolve", authenticateToken, requireAdmin, (req, re
 const hashQrToken = value => crypto.createHash("sha256").update(String(value)).digest("hex");
 
 app.post("/api/checkout-requests", authenticateToken, (req, res) => {
-    const rawIds = req.body && req.body.equipment_ids;
-    if (!Array.isArray(rawIds) || rawIds.length < 1 || rawIds.length > 25) {
-        return res.status(400).json({ message: "Select between 1 and 25 equipment items." });
+    // Preferred payload: items: [{ equipment_id, quantity }]. Legacy equipment_ids remains supported.
+    const rawItems = Array.isArray(req.body && req.body.items)
+        ? req.body.items
+        : Array.isArray(req.body && req.body.equipment_ids)
+            ? req.body.equipment_ids.map(equipment_id => ({ equipment_id, quantity: 1 }))
+            : null;
+    if (!rawItems || rawItems.length < 1 || rawItems.length > 25) {
+        return res.status(400).json({ message: "Select 1–25 equipment types for checkout." });
     }
-    const ids = [...new Set(rawIds.map(Number))];
-    if (ids.length !== rawIds.length || ids.some(id => !Number.isSafeInteger(id) || id <= 0)) {
-        return res.status(400).json({ message: "Equipment selection contains invalid or duplicate IDs." });
+    const items = rawItems.map(item => ({
+        equipment_id: Number(item && item.equipment_id),
+        quantity: Number(item && item.quantity)
+    }));
+    const ids = items.map(item => item.equipment_id);
+    if (ids.some(id => !Number.isSafeInteger(id) || id <= 0) ||
+        items.some(item => !Number.isSafeInteger(item.quantity) || item.quantity < 1 || item.quantity > 500) ||
+        new Set(ids).size !== ids.length) {
+        return res.status(400).json({ message: "Each equipment type must appear once with a whole-number quantity between 1 and 500." });
     }
     const token = crypto.randomBytes(32).toString("hex");
     const tokenHash = hashQrToken(token);
@@ -580,19 +591,26 @@ app.post("/api/checkout-requests", authenticateToken, (req, res) => {
                 if (selectError || rows.length !== ids.length) {
                     return connection.rollback(() => { connection.release(); res.status(selectError ? 500 : 400).json({ message: selectError ? "Could not validate equipment." : "One or more selected items no longer exist." }); });
                 }
-                const unavailable = rows.filter(item => !["AVAILABLE"].includes(String(item.status || "").toUpperCase()) || Number(item.available_quantity) < 1);
+                const byId = new Map(rows.map(row => [Number(row.equipment_id), row]));
+                const unavailable = items.filter(item => {
+                    const equipment = byId.get(item.equipment_id);
+                    return !equipment || String(equipment.status || "").toUpperCase() !== "AVAILABLE" || Number(equipment.available_quantity) < item.quantity;
+                }).map(item => {
+                    const equipment = byId.get(item.equipment_id);
+                    return { equipment_code: equipment?.equipment_code || String(item.equipment_id), requested: item.quantity, available: Number(equipment?.available_quantity || 0) };
+                });
                 if (unavailable.length) {
-                    return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Some selected equipment is unavailable. Refresh the inventory and try again.", unavailable: unavailable.map(item => item.equipment_code) }); });
+                    return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Requested quantity exceeds available stock or equipment is unavailable.", unavailable }); });
                 }
                 connection.query("INSERT INTO checkout_requests (user_id, token_hash, status) VALUES (?, ?, 'PENDING')", [req.user.user_id, tokenHash], (insertError, result) => {
-                    if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create checkout request. Apply the QR migration and try again." }); });
-                    const values = ids.map(id => [result.insertId, id]);
-                    connection.query("INSERT INTO checkout_request_items (request_id, equipment_id) VALUES ?", [values], itemError => {
-                        if (itemError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not save the selected items." }); });
+                    if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create checkout request. Apply the reviewed quantity/return migration first." }); });
+                    const values = items.map(item => [result.insertId, item.equipment_id, item.quantity]);
+                    connection.query("INSERT INTO checkout_request_items (request_id, equipment_id, quantity) VALUES ?", [values], itemError => {
+                        if (itemError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not save the selected quantities. Check that the quantity migration is applied." }); });
                         connection.commit(commitError => {
                             connection.release();
                             if (commitError) return res.status(500).json({ message: "Could not save checkout request." });
-                            res.status(201).json({ message: "Checkout QR request created. Show this token to the lab administrator.", request_id: result.insertId, token, status: "PENDING", items: rows.map(item => ({ equipment_id: item.equipment_id, equipment_code: item.equipment_code, name: item.name })) });
+                            res.status(201).json({ message: "Checkout QR request created. Show this QR to the lab administrator.", request_id: result.insertId, token, status: "PENDING", items: items.map(item => { const equipment = byId.get(item.equipment_id); return { equipment_id: item.equipment_id, equipment_code: equipment.equipment_code, name: equipment.name, quantity: item.quantity }; }) });
                         });
                     });
                 });
@@ -609,7 +627,7 @@ app.post("/api/admin/checkout-requests/scan", authenticateToken, requireAdmin, (
         if (!requests.length) return res.status(404).json({ message: "QR token not found." });
         const request = requests[0];
         if (request.status !== "PENDING") return res.status(409).json({ message: "This QR request has already been used or cancelled.", status: request.status });
-        db.query("SELECT e.equipment_id, e.equipment_code, e.name, e.status, COALESCE(e.available_quantity, 1) AS available_quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? ORDER BY i.request_item_id", [request.request_id], (itemError, items) => {
+        db.query("SELECT e.equipment_id, e.equipment_code, e.name, e.status, COALESCE(e.available_quantity, 1) AS available_quantity, COALESCE(i.quantity, 1) AS quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? ORDER BY i.request_item_id", [request.request_id], (itemError, items) => {
             if (itemError) return res.status(500).json({ message: "Could not load requested equipment." });
             res.json({ request: { request_id: request.request_id, status: request.status, created_at: request.created_at }, student: { user_id: request.user_id, name: request.student_name, student_id: request.student_id }, items });
         });
@@ -627,24 +645,31 @@ app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, 
                 if (requestError || !requests.length) return connection.rollback(() => { connection.release(); res.status(requestError ? 500 : 404).json({ message: requestError ? "Could not verify checkout request." : "QR token not found." }); });
                 const request = requests[0];
                 if (request.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This QR has already been used or cancelled.", status: request.status }); });
-                connection.query("SELECT e.equipment_id, e.equipment_code, e.status, COALESCE(e.available_quantity, 1) AS available_quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? FOR UPDATE", [request.request_id], (itemsError, items) => {
+                connection.query("SELECT e.equipment_id, e.equipment_code, e.status, COALESCE(e.available_quantity, 1) AS available_quantity, COALESCE(i.quantity, 1) AS quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? FOR UPDATE", [request.request_id], (itemsError, items) => {
                     if (itemsError || !items.length) return connection.rollback(() => { connection.release(); res.status(itemsError ? 500 : 400).json({ message: "No equipment found in this checkout request." }); });
-                    if (items.some(item => String(item.status).toUpperCase() !== "AVAILABLE" || Number(item.available_quantity) < 1)) {
-                        return connection.rollback(() => { connection.release(); res.status(409).json({ message: "At least one item is now unavailable. No equipment was issued; create a new request after refreshing inventory." }); });
+                    if (items.some(item => String(item.status).toUpperCase() !== "AVAILABLE" || Number(item.available_quantity) < Number(item.quantity || 1))) {
+                        return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Requested stock is no longer available. No equipment was issued; create a new request after refreshing inventory." }); });
                     }
-                    connection.query("SELECT equipment_id FROM transactions WHERE user_id = ? AND status = 'ACTIVE' AND equipment_id IN (?)", [request.user_id, items.map(item => item.equipment_id)], (activeError, activeRows) => {
-                        if (activeError || activeRows.length) return connection.rollback(() => { connection.release(); res.status(activeError ? 500 : 409).json({ message: activeError ? "Could not check existing loans." : "Student already has an active loan for one or more selected items." }); });
-                        connection.query("INSERT INTO transactions (user_id, equipment_id, status) VALUES ?", [items.map(item => [request.user_id, item.equipment_id, "ACTIVE"])], insertError => {
-                            if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); });
-                            const ids = items.map(item => item.equipment_id);
-                            connection.query("UPDATE equipment SET available_quantity = GREATEST(0, COALESCE(available_quantity, 1) - 1), status = CASE WHEN COALESCE(available_quantity, 1) - 1 <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END WHERE equipment_id IN (?)", [ids], updateError => {
-                                if (updateError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not update inventory." }); });
+                    const transactionRows = [];
+                    for (const item of items) {
+                        for (let count = 0; count < Number(item.quantity || 1); count++) transactionRows.push([request.user_id, item.equipment_id, "ACTIVE"]);
+                    }
+                    connection.query("INSERT INTO transactions (user_id, equipment_id, status) VALUES ?", [transactionRows], insertError => {
+                        if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); });
+                        let remaining = items.length;
+                        let updateFailed = false;
+                        items.forEach(item => {
+                            connection.query("UPDATE equipment SET available_quantity = GREATEST(0, COALESCE(available_quantity, 1) - ?), status = CASE WHEN COALESCE(available_quantity, 1) - ? <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END WHERE equipment_id = ? AND COALESCE(available_quantity, 1) >= ?", [item.quantity, item.quantity, item.equipment_id, item.quantity], (updateError, updateResult) => {
+                                if (updateError || updateResult.affectedRows !== 1) updateFailed = true;
+                                remaining--;
+                                if (remaining !== 0) return;
+                                if (updateFailed) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Stock changed while issuing. No issue was saved; refresh and retry." }); });
                                 connection.query("UPDATE checkout_requests SET status = 'ISSUED', issued_at = NOW(), issued_by = ? WHERE request_id = ? AND status = 'PENDING'", [req.user.user_id, request.request_id], (markError, result) => {
                                     if (markError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Checkout request state changed. No issue was saved." }); });
                                     connection.commit(commitError => {
                                         connection.release();
                                         if (commitError) return res.status(500).json({ message: "Issue could not be committed. Check transaction history before retrying." });
-                                        res.json({ message: "Equipment issued successfully.", request_id: request.request_id, equipment_codes: items.map(item => item.equipment_code) });
+                                        res.json({ message: "Equipment issued successfully.", request_id: request.request_id, equipment: items.map(item => ({ equipment_id: item.equipment_id, equipment_code: item.equipment_code, quantity: Number(item.quantity || 1) })), total_units: transactionRows.length });
                                     });
                                 });
                             });
