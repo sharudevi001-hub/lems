@@ -4,6 +4,13 @@
 ALTER TABLE checkout_request_items
   ADD COLUMN quantity INT UNSIGNED NOT NULL DEFAULT 1 AFTER equipment_id;
 
+-- Student directory fields required by the college registration workflow.
+ALTER TABLE users
+  ADD COLUMN department VARCHAR(100) NULL,
+  ADD COLUMN academic_year VARCHAR(20) NULL,
+  ADD COLUMN section VARCHAR(20) NULL,
+  ADD COLUMN account_status ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE';
+
 -- Each equipment record receives an opaque QR token. Existing equipment is backfilled.
 ALTER TABLE equipment ADD COLUMN qr_token CHAR(32) NULL;
 UPDATE equipment SET qr_token = REPLACE(UUID(), '-', '') WHERE qr_token IS NULL OR qr_token = '';
