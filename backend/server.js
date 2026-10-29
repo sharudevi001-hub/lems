@@ -671,6 +671,34 @@ app.post("/api/checkout-requests", authenticateToken, (req, res) => {
     });
 });
 
+// Let a student check whether their checkout QR has been accepted by the administrator.
+app.get("/api/checkout-requests/:requestId", authenticateToken, (req, res) => {
+    const requestId = Number(req.params.requestId);
+    if (!Number.isSafeInteger(requestId) || requestId < 1) {
+        return res.status(400).json({ message: "Invalid checkout request ID." });
+    }
+    const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
+    const sql = "SELECT request_id, user_id, status, created_at, issued_at FROM checkout_requests WHERE request_id = ?" +
+        (isAdmin ? "" : " AND user_id = ?") + " LIMIT 1";
+    const params = isAdmin ? [requestId] : [requestId, req.user.user_id];
+    db.query(sql, params, (err, rows) => {
+        if (err) {
+            console.error("Checkout request status lookup failed:", err.message);
+            return res.status(500).json({ message: "Could not load checkout request status." });
+        }
+        if (!rows.length) return res.status(404).json({ message: "Checkout request not found." });
+        const request = rows[0];
+        return res.json({
+            request: {
+                request_id: request.request_id,
+                status: request.status,
+                created_at: request.created_at,
+                issued_at: request.issued_at
+            }
+        });
+    });
+});
+
 app.post("/api/admin/checkout-requests/scan", authenticateToken, requireAdmin, (req, res) => {
     const token = String((req.body || {}).token || "").trim();
     if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid checkout QR token is required." });
