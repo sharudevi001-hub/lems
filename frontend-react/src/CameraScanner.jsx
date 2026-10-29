@@ -42,10 +42,7 @@ export default function CameraScanner({ onDetected, label = "Scan QR / barcode",
         if (cancelled) return;
         await scanner.start(
           cameraConfig,
-          { fps: 10, qrbox: (viewWidth, viewHeight) => {
-              const side = Math.max(160, Math.min(260, Math.floor(Math.min(viewWidth, viewHeight) * 0.72)));
-              return { width: side, height: side };
-            }, aspectRatio: 1.0, disableFlip: false },
+          { fps: 15, disableFlip: false },
           decodedText => {
             const value = String(decodedText || "").trim();
             if (!value || detectedRef.current) return;
@@ -109,7 +106,8 @@ export default function CameraScanner({ onDetected, label = "Scan QR / barcode",
       {cameraBusy && <span className="muted">Starting camera…</span>}
     </div>
     {open && <div className="stack" style={{ gap: 8 }}>
-      <div id={videoRegionId} style={{ width: "100%", maxWidth: 420, minHeight: 260, overflow: "hidden", borderRadius: 14, background: "#172235" }} aria-label={label} />
+      <p className="muted">Keep the entire QR code visible in the camera view. The scanner checks the full camera frame, so the QR does not need to fit inside a small box.</p>
+      <div id={videoRegionId} style={{ width: "100%", maxWidth: 420, minHeight: 320, overflow: "hidden", borderRadius: 14, background: "#172235" }} aria-label={label} />
       <button className="button button--secondary" type="button" onClick={close}>Stop camera</button>
     </div>}
     {error && <p className="muted" role="status">{error}</p>}
