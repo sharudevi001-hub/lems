@@ -39,6 +39,7 @@ export const api = {
   resolveEquipmentQr: token => request("equipment/qr/" + encodeURIComponent(token)),
   checkout: equipment_id => request("checkout", { method: "POST", body: JSON.stringify({ equipment_id }) }),
   createCheckoutRequest: items => request("checkout-requests", { method: "POST", body: JSON.stringify({ items }) }),
+  checkoutRequestStatus: requestId => request("checkout-requests/" + encodeURIComponent(requestId)),
   scanCheckoutRequest: token => request("admin/checkout-requests/scan", { method: "POST", body: JSON.stringify({ token }) }),
   issueCheckoutRequest: token => request("admin/checkout-requests/issue", { method: "POST", body: JSON.stringify({ token }) }),
   createReturnQr: transaction_id => request("return-qr", { method: "POST", body: JSON.stringify({ transaction_id }) }),
