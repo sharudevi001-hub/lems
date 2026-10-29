@@ -83,17 +83,37 @@ function Overview({user}) {
 function EquipmentPage({user}) {
  const [items,setItems]=useState([]),[busy,setBusy]=useState(true),[error,setError]=useState(""),[search,setSearch]=useState(""),[notice,setNotice]=useState("");
  const [cart,setCart]=useState({}),[requestBusy,setRequestBusy]=useState(false),[checkoutToken,setCheckoutToken]=useState("");
+ const [checkoutRequestId,setCheckoutRequestId]=useState(null),[checkoutStatus,setCheckoutStatus]=useState(""),[statusError,setStatusError]=useState("");
  const load=useCallback(async()=>{setBusy(true);setError("");try{const r=await api.equipment();setItems(Array.isArray(r)?r:[]);}catch(e){setError(e.message);}finally{setBusy(false);}},[]);
  useEffect(()=>{load();},[load]);
+ useEffect(()=>{
+  if(!checkoutRequestId||checkoutStatus==="ISSUED"||checkoutStatus==="CANCELLED") return;
+  let alive=true;
+  const check=async()=>{
+   try{
+    const result=await api.checkoutRequestStatus(checkoutRequestId);
+    if(!alive)return;
+    const status=String(result.request?.status||"").toUpperCase();
+    setCheckoutStatus(status);
+    setStatusError("");
+    if(status==="ISSUED") await load();
+   }catch(err){if(alive)setStatusError(err.message);}
+  };
+  check();
+  const timer=setInterval(check,4000);
+  return()=>{alive=false;clearInterval(timer);};
+ },[checkoutRequestId,checkoutStatus,load]);
+
  const isAdmin=String(user.role||"").toLowerCase()==="admin";
  const filtered=useMemo(()=>items.filter(i=>[i.equipment_code,i.name,i.category,i.status].some(v=>String(v||"").toLowerCase().includes(search.toLowerCase()))),[items,search]);
  const cartItems=Object.entries(cart).map(([id,quantity])=>({equipment_id:Number(id),quantity:Number(quantity)})).filter(item=>item.quantity>0);
  const cartUnits=cartItems.reduce((sum,item)=>sum+item.quantity,0);
  const handleEquipmentScan=useCallback(async token=>{setError("");setNotice("");try{const result=await api.resolveEquipmentQr(token);const equipment=result.equipment;if(!equipment)throw new Error("Equipment QR was not recognized.");if(String(equipment.status).toUpperCase()!=="AVAILABLE"||Number(equipment.available_quantity)<1)throw new Error("This equipment is currently unavailable.");setItems(old=>old.some(item=>Number(item.equipment_id)===Number(equipment.equipment_id))?old.map(item=>Number(item.equipment_id)===Number(equipment.equipment_id)?{...item,...equipment}:item):[equipment,...old]);setCart(old=>({...old,[equipment.equipment_id]:Math.min(Number(equipment.available_quantity),Number(old[equipment.equipment_id]||0)+1)}));setNotice("Scanned "+equipment.equipment_code+" — "+equipment.name+". Added one unit to the cart.");}catch(e){setError(e.message);}},[]);
  function setQuantity(item,raw){const max=Math.max(0,Number(item.available_quantity??1));const quantity=Math.max(0,Math.min(max,Math.floor(Number(raw)||0)));setCart(old=>{const next={...old};if(quantity===0)delete next[item.equipment_id];else next[item.equipment_id]=quantity;return next;});setNotice("");}
- async function submitCart(){setError("");setNotice("");setRequestBusy(true);try{const result=await api.createCheckoutRequest(cartItems);setCheckoutToken(result.token);setNotice("Checkout request created. Show this QR to the lab admin for issue confirmation.");setCart({});}catch(e){setError(e.message);}finally{setRequestBusy(false);}}
+ async function submitCart(){setError("");setNotice("");setStatusError("");setCheckoutStatus("PENDING");setRequestBusy(true);try{const result=await api.createCheckoutRequest(cartItems);setCheckoutToken(result.token);setCheckoutRequestId(result.request_id);setCheckoutStatus(String(result.status||"PENDING").toUpperCase());setNotice("Checkout request created. Show this QR to the lab admin for issue confirmation.");setCart({});}catch(e){setCheckoutStatus("");setCheckoutRequestId(null);setError(e.message);}finally{setRequestBusy(false);}}
  return <><PageTitle title="Equipment inventory" subtitle="Choose equipment and quantities, then create one checkout QR." actions={<Button kind="secondary" onClick={load}>↻ Refresh</Button>}/><Alert tone="error">{error}</Alert><Alert tone="success">{notice}</Alert>
- {checkoutToken&&<Card title="Your checkout QR" subtitle="Keep this QR private. The admin must scan it and confirm issue before equipment is checked out."><div className="stack" style={{alignItems:"center",textAlign:"center"}}><QRCode value={checkoutToken} size={220} level="M" includeMargin/><p className="muted">Request token</p><code style={{overflowWrap:"anywhere"}}>{checkoutToken}</code><Button kind="secondary" onClick={()=>navigator.clipboard?.writeText(checkoutToken)}>Copy token</Button><Button kind="secondary" onClick={()=>setCheckoutToken("")}>Close QR</Button></div></Card>}
+ {checkoutToken&&checkoutStatus!=="ISSUED"&&<Card title="Your checkout QR" subtitle="Keep this QR private. The admin must scan it and confirm issue before equipment is checked out."><Alert tone="info">Status: {checkoutStatus||"PENDING"} — this page checks automatically for admin confirmation.</Alert><Alert tone="error">{statusError}</Alert><div className="stack" style={{alignItems:"center",textAlign:"center"}}><QRCode value={checkoutToken} size={220} level="M" includeMargin/><p className="muted">Request token</p><code style={{overflowWrap:"anywhere"}}>{checkoutToken}</code><Button kind="secondary" onClick={()=>navigator.clipboard?.writeText(checkoutToken)}>Copy token</Button><Button kind="secondary" onClick={()=>{setCheckoutToken("");setCheckoutRequestId(null);setCheckoutStatus("");setStatusError("");}}>Close QR</Button></div></Card>}
+ {checkoutRequestId&&checkoutStatus==="ISSUED"&&<Card title="Checkout confirmed" subtitle="The lab administrator accepted your checkout request."><Alert tone="success">CONFIRMED — equipment issue was recorded successfully.</Alert><p className="muted">Your issued equipment is now listed in My transactions. Refresh that page if it is already open.</p><Button kind="secondary" onClick={()=>{setCheckoutToken("");setCheckoutRequestId(null);setCheckoutStatus("");setStatusError("");}}>Dismiss confirmation</Button></Card>}
  <Card title="Scan equipment QR" subtitle="Use your phone camera to scan an equipment QR, or enter its token manually."><CameraScanner onDetected={handleEquipmentScan} label="Equipment QR token" placeholder="Scan or paste equipment QR token"/></Card><Card><Field label="Search inventory" placeholder="Code, equipment, category or status…" value={search} onChange={e=>setSearch(e.target.value)}/></Card>
  {!isAdmin&&<Card title={"Checkout cart ("+cartUnits+" unit"+(cartUnits===1?"":"s")+")"} subtitle="Set the quantity needed for each equipment type. Quantities cannot exceed available stock.">
  {cartItems.length>0?<div className="table-wrap"><table><thead><tr><th>Equipment</th><th>Quantity</th><th>Available</th><th></th></tr></thead><tbody>{cartItems.map(entry=>{const item=items.find(i=>Number(i.equipment_id)===entry.equipment_id);if(!item)return null;return <tr key={entry.equipment_id}><td>{item.equipment_code} — {item.name}</td><td>{entry.quantity}</td><td>{item.available_quantity??1}</td><td><Button className="small" kind="secondary" onClick={()=>setQuantity(item,0)}>Remove</Button></td></tr>})}</tbody></table></div>:<p className="muted">Your cart is empty. Set a quantity in the inventory below.</p>}
