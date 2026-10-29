@@ -41,6 +41,39 @@ async function main() {
       if (!tableNames.has(requiredTable)) throw new Error("Required table is missing: " + requiredTable + ". Apply the base LEMS migrations first.");
     }
 
+    // Repair core columns expected by the current equipment and student APIs.
+    // All changes are conditional and preserve existing inventory and student rows.
+    for (const [column, definition] of [
+      ["qr_token", "CHAR(32) NULL"],
+      ["total_quantity", "INT UNSIGNED NOT NULL DEFAULT 1"],
+      ["available_quantity", "INT UNSIGNED NOT NULL DEFAULT 1"]
+    ]) {
+      if (!(await columnExists(connection, "equipment", column))) {
+        await connection.query("ALTER TABLE equipment ADD COLUMN " + column + " " + definition);
+        console.log("Added equipment." + column);
+      } else console.log("equipment." + column + " already exists");
+    }
+
+    if (await columnExists(connection, "equipment", "qr_token")) {
+      await connection.query("UPDATE equipment SET qr_token = REPLACE(UUID(), '-', '') WHERE qr_token IS NULL OR qr_token = ''");
+      if (!(await indexExists(connection, "equipment", "uq_equipment_qr_token"))) {
+        await connection.query("CREATE UNIQUE INDEX uq_equipment_qr_token ON equipment (qr_token)");
+        console.log("Added equipment QR token index");
+      }
+    }
+
+    for (const [column, definition] of [
+      ["department", "VARCHAR(100) NULL"],
+      ["academic_year", "VARCHAR(20) NULL"],
+      ["section", "VARCHAR(20) NULL"],
+      ["account_status", "ENUM('ACTIVE','INACTIVE') NOT NULL DEFAULT 'ACTIVE'"]
+    ]) {
+      if (!(await columnExists(connection, "users", column))) {
+        await connection.query("ALTER TABLE users ADD COLUMN " + column + " " + definition);
+        console.log("Added users." + column);
+      } else console.log("users." + column + " already exists");
+    }
+
     if (!(await columnExists(connection, "transactions", "checkout_request_id"))) {
       await connection.query("ALTER TABLE transactions ADD COLUMN checkout_request_id BIGINT UNSIGNED NULL");
       console.log("Added transactions.checkout_request_id");
