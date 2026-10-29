@@ -707,7 +707,7 @@ app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, 
                         for (let count = 0; count < Number(item.quantity || 1); count++) transactionRows.push([request.user_id, item.equipment_id, "ACTIVE"]);
                     }
                     connection.query("INSERT INTO transactions (user_id, equipment_id, status, checkout_request_id) VALUES ?", [transactionRows.map(row => [row[0],row[1],row[2],request.request_id])], insertError => {
-                        if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); });
+                        if (insertError) { console.error("[checkout issue] transaction insert failed:", insertError.code || "UNKNOWN", insertError.message || "No database error message"); return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); }); }
                         let remaining = items.length;
                         let updateFailed = false;
                         items.forEach(item => {
