@@ -1,47 +1,5 @@
 import React, { useEffect, useId, useRef, useState } from "react";
-
-const QR_SCANNER_URLS = [
-  "https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js",
-  "https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"
-];
-
-function loadQrScannerLibrary() {
-  if (typeof window !== "undefined" && window.Html5Qrcode) return Promise.resolve(window.Html5Qrcode);
-  if (typeof document === "undefined") return Promise.reject(new Error("Camera scanning is unavailable."));
-  return new Promise((resolve, reject) => {
-    let script = document.querySelector('script[data-lems-qr-scanner="true"]');
-    if (script?.dataset.loaded === "true" && window.Html5Qrcode) return resolve(window.Html5Qrcode);
-    if (script?.dataset.failed === "true") script.remove();
-    script = document.querySelector('script[data-lems-qr-scanner="true"]');
-    if (script) {
-      script.addEventListener("load", () => window.Html5Qrcode ? resolve(window.Html5Qrcode) : reject(new Error("QR scanner library did not initialize.")), { once: true });
-      script.addEventListener("error", () => reject(new Error("QR scanner library could not load. Check your internet connection.")), { once: true });
-      return;
-    }
-
-    let sourceIndex = 0;
-    const tryNextSource = () => {
-      if (sourceIndex >= QR_SCANNER_URLS.length) {
-        script.dataset.failed = "true";
-        reject(new Error("QR scanner library could not load. Check your internet connection and try again."));
-        return;
-      }
-      const current = document.createElement("script");
-      current.src = QR_SCANNER_URLS[sourceIndex++];
-      current.async = true;
-      current.dataset.lemsQrScanner = "true";
-      current.onload = () => {
-        current.dataset.loaded = "true";
-        if (window.Html5Qrcode) resolve(window.Html5Qrcode);
-        else { current.remove(); tryNextSource(); }
-      };
-      current.onerror = () => { current.remove(); tryNextSource(); };
-      script = current;
-      document.head.appendChild(current);
-    };
-    tryNextSource();
-  });
-}
+import { Html5Qrcode } from "html5-qrcode";
 
 export default function CameraScanner({ onDetected, label = "Scan QR / barcode", placeholder = "Paste or type scanned code" }) {
   const videoRegionId = "lems-qr-" + useId().replace(/:/g, "");
@@ -65,7 +23,6 @@ export default function CameraScanner({ onDetected, label = "Scan QR / barcode",
 
     async function start() {
       try {
-        const Html5Qrcode = await loadQrScannerLibrary();
         if (cancelled) return;
         scanner = new Html5Qrcode(videoRegionId, { verbose: false });
         scannerRef.current = scanner;
