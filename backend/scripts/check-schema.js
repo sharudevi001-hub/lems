@@ -10,8 +10,8 @@ const config = {
     connectTimeout: 10000
 };
 const required = {
-    users: ["user_id", "name", "student_id", "email", "password", "role", "reset_token", "reset_token_expires", "must_change_password", "rfid_uid", "department", "academic_year", "section", "account_status"],
-    equipment: ["equipment_id", "equipment_code", "name", "category", "rfid_tag", "qr_token", "status", "runtime_hours", "calibration_limit", "total_quantity", "available_quantity"],
+    users: ["user_id", "name", "student_id", "email", "password", "role", "reset_token", "reset_token_expires", "must_change_password", "department", "academic_year", "section", "account_status"],
+    equipment: ["equipment_id", "equipment_code", "name", "category", "qr_token", "status", "runtime_hours", "calibration_limit", "total_quantity", "available_quantity"],
     transactions: ["transaction_id", "user_id", "equipment_id", "checkout_time", "return_time", "status", "checkout_request_id"],
     complaints: ["complaint_id", "user_id", "equipment_id", "issue_description", "status", "created_at"],
     checkout_requests: ["request_id", "user_id", "token_hash", "status", "created_at", "issued_at", "issued_by"],
@@ -20,7 +20,6 @@ const required = {
     return_session_items: ["return_session_item_id", "return_session_id", "transaction_id", "condition_status", "condition_notes", "processed_at"],
     equipment_condition_reports: ["condition_report_id", "transaction_id", "equipment_id", "user_id", "return_session_id", "condition_status", "notes", "created_at"],
     lems_audit_logs: ["audit_id", "user_id", "action", "entity_type", "entity_id", "details", "created_at"],
-    rfid_registration_sessions: ["registration_session_id", "target_user_id", "created_by", "status", "created_at", "expires_at", "used_at", "used_uid"],
     return_qr_tokens: ["return_token_id", "transaction_id", "token_hash", "status", "created_at", "used_at", "used_by"]
 };
 
