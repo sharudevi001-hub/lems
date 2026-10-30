@@ -163,6 +163,7 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         equipment_code,
         name,
         category,
+        rfid_tag,
         status,
         calibration_limit,
         total_quantity
@@ -252,8 +253,8 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
     });
 });
 
-// Admin-only student directory.
-// Student directory response omits card identifiers.
+// Admin-only student directory and RFID card linking.
+// Uses the existing users.rfid_uid column; no additional table or migration is required.
 app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
     const sql = "SELECT * FROM users WHERE LOWER(role) = 'student' ORDER BY name ASC";
 
@@ -277,6 +278,777 @@ app.put("/api/admin/students/:studentId/status", authenticateToken, requireAdmin
     });
 });
 
+app.post("/api/login", loginLimiter, (req, res) => {
+    const { student_id, password } = req.body || {};
+    if (!student_id || !password) return res.status(400).json({ message: "Student ID and password are required." });
+    db.query("SELECT * FROM users WHERE student_id = ? LIMIT 1",
+        [String(student_id).trim()], async (err, rows) => {
+            if (err) {
+                console.error("Login database error:", err.message);
+                return res.status(500).json({ message: "Login is temporarily unavailable." });
+            }
+            if (!rows.length) return res.status(401).json({ message: "Invalid student ID or password." });
+            const row = rows[0];
+            const stored = String(row.password || "");
+            let matches = false;
+            try {
+                matches = /^\$2[aby]\$/.test(stored) ? await bcrypt.compare(String(password), stored) : stored === String(password);
+            } catch (verifyError) {
+                console.error("Password verification error:", verifyError.message);
+                return res.status(500).json({ message: "Login is temporarily unavailable." });
+            }
+            if (!matches) return res.status(401).json({ message: "Invalid student ID or password." });
+            if (String(row.account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(403).json({ message: "This account is inactive. Contact the lab administrator." });
+            if (!/^\$2[aby]\$/.test(stored)) {
+                try {
+                    const upgraded = await bcrypt.hash(String(password), 12);
+                    db.query("UPDATE users SET password = ? WHERE user_id = ?", [upgraded, row.user_id], upgradeError => {
+                        if (upgradeError) console.error("Legacy password upgrade failed:", upgradeError.message);
+                    });
+                } catch (hashError) {
+                    console.error("Password rehash failed:", hashError.message);
+                }
+            }
+            const user = {
+                user_id: row.user_id,
+                name: row.name,
+                student_id: row.student_id,
+                email: row.email,
+                role: String(row.role || "student").toLowerCase(),
+                must_change_password: Boolean(row.must_change_password)
+            };
+            const token = jwt.sign(
+                { user_id: user.user_id, student_id: user.student_id, role: user.role },
+                JWT_SECRET,
+                { expiresIn: "8h", issuer: "lems-api", audience: "lems-app" }
+            );
+            res.json({ message: "Login successful", user, token });
+        });
+});
+
+// Mandatory initial password change for administrator-created student accounts.
+app.post("/api/change-password", authenticateToken, loginLimiter, (req, res) => {
+    const currentPassword = String((req.body || {}).current_password || "");
+    const newPassword = String((req.body || {}).new_password || "");
+    if (!currentPassword || newPassword.length < 8 || newPassword.length > 128) {
+        return res.status(400).json({ message: "Enter your current password and a new password of 8–128 characters." });
+    }
+    db.query("SELECT user_id, password FROM users WHERE user_id = ? LIMIT 1", [req.user.user_id], async (err, rows) => {
+        if (err || !rows.length) return res.status(500).json({ message: "Could not verify your account." });
+        const stored = String(rows[0].password || "");
+        let matches = false;
+        try { matches = /^\$2[aby]\$/.test(stored) ? await bcrypt.compare(currentPassword, stored) : stored === currentPassword; }
+        catch { return res.status(500).json({ message: "Could not verify your password." }); }
+        if (!matches) return res.status(401).json({ message: "Current password is incorrect." });
+        if (currentPassword === newPassword) return res.status(400).json({ message: "Choose a password different from your initial password." });
+        try {
+            const hash = await bcrypt.hash(newPassword, 12);
+            db.query("UPDATE users SET password = ?, must_change_password = 0 WHERE user_id = ?", [hash, req.user.user_id], updateError => {
+                if (updateError) return res.status(500).json({ message: "Could not update your password." });
+                return res.json({ message: "Password changed successfully. Please sign in again." });
+            });
+        } catch { return res.status(500).json({ message: "Could not secure your new password." }); }
+    });
+});
+
+// Forgot Password API - Generates reset link & sends real email
+app.post("/api/forgot-password", loginLimiter, (req, res) => {
+    const email = String((req.body || {}).email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ message: "Email is required." });
+
+    // Production reset emails must be configured before a token is created.
+    if (process.env.NODE_ENV === "production" && !transporter) {
+        return res.status(503).json({ message: "Password-reset email is not configured. Please contact the lab administrator." });
+    }
+
+    const checkSql = "SELECT user_id, name, email FROM users WHERE LOWER(email) = ? LIMIT 1";
+    db.query(checkSql, [email], (err, users) => {
+        if (err) {
+            console.error("Forgot-password lookup failed:", err.message);
+            return res.status(500).json({ message: "Password reset is temporarily unavailable." });
+        }
+        if (!users.length) {
+            if (process.env.NODE_ENV === "production") {
+                return res.json({ message: "If the account exists, password-reset instructions will be sent to its registered email." });
+            }
+            return res.status(404).json({ message: "No account found with this email address." });
+        }
+
+        const user = users[0];
+        const token = crypto.randomBytes(32).toString("hex");
+        const expires = new Date(Date.now() + 60 * 60 * 1000);
+        db.query("UPDATE users SET reset_token = ?, reset_token_expires = ? WHERE user_id = ?", [token, expires, user.user_id], (updateError) => {
+            if (updateError) {
+                console.error("Could not save password-reset token:", updateError.message);
+                return res.status(500).json({ message: "Password reset is temporarily unavailable." });
+            }
+
+            const baseUrl = (process.env.APP_BASE_URL || (req.protocol + "://" + req.get("host"))).replace(/\/+$/, "");
+            const resetLink = baseUrl + "/reset-password?token=" + encodeURIComponent(token);
+            const mailOptions = {
+                from: '"LEMS System" <' + EMAIL_USER + ">",
+                to: user.email,
+                subject: "LEMS - Password Reset Request",
+                text: "A password reset was requested for your LEMS account. This link expires in one hour: " + resetLink + "\nIf you did not request this, ignore this email.",
+                html: '<div style="font-family:Arial,sans-serif;padding:20px"><h2>LEMS password reset</h2><p>Hello ' +
+                    String(user.name || "User").replace(/[&<>"]/g, "") +
+                    ',</p><p>Use this one-hour link to reset your LEMS password:</p><p><a href="' + resetLink + '">Reset password</a></p><p>If you did not request this, ignore this email.</p></div>'
+            };
+            transporter.sendMail(mailOptions, (mailError) => {
+                if (mailError) {
+                    console.error("Password-reset email delivery failed:", mailError.message);
+                    return res.status(503).json({ message: "Password-reset email could not be sent. Please contact the lab administrator." });
+                }
+                // Prevent account enumeration in production.
+                if (process.env.NODE_ENV === "production") {
+                    return res.json({ message: "If the account exists, password-reset instructions will be sent to its registered email." });
+                }
+                res.json({ message: "Password reset email sent.", resetLink });
+            });
+        });
+    });
+});
+
+// Reset Password API - Updates password using token
+app.post("/api/reset-password", loginLimiter, (req, res) => {
+    const { token, new_password } = req.body;
+
+    if (!token || !new_password) {
+        return res.status(400).json({ message: "Token and new password are required." });
+    }
+
+    const checkSql = "SELECT user_id, reset_token_expires FROM users WHERE reset_token = ?";
+    db.query(checkSql, [token.trim()], (err, users) => {
+        if (err) {
+            console.error("Reset password check error:", err);
+            return res.status(500).json({ error: err.message });
+        }
+
+        if (users.length === 0) {
+            return res.status(400).json({ message: "Invalid or unrecognized password reset token." });
+        }
+
+        const user = users[0];
+
+        // Expired, missing, and invalid expiry timestamps must all be rejected.
+        const expiryMs = user.reset_token_expires ? new Date(user.reset_token_expires).getTime() : Number.NaN;
+        if (!Number.isFinite(expiryMs) || expiryMs < Date.now()) {
+            return res.status(400).json({ message: "Invalid or expired password-reset link." });
+        }
+
+        if (String(new_password).length < 8 || String(new_password).length > 128) {
+            return res.status(400).json({ message: "Password must be between 8 and 128 characters." });
+        }
+        const userId = user.user_id;
+        bcrypt.hash(String(new_password), 12, (hashError, passwordHash) => {
+            if (hashError) return res.status(500).json({ message: "Could not secure the new password." });
+            const updateSql = "UPDATE users SET password = ?, reset_token = NULL, reset_token_expires = NULL WHERE user_id = ?";
+            db.query(updateSql, [passwordHash, userId], (updateError) => {
+                if (updateError) {
+                    console.error("Password update failed:", updateError.message);
+                    return res.status(500).json({ message: "Password reset failed." });
+                }
+                res.json({ message: "Password reset successful. You can now sign in." });
+            });
+        });
+    });
+});
+
+// Submit Complaint / Maintenance Request API (Student Side)
+app.post("/api/complaints", authenticateToken, (req, res) => {
+    const equipmentId = Number(req.body?.equipment_id);
+    const issueDescription = String(req.body?.issue_description || "").trim();
+    const userId = req.user.user_id;
+
+    if (!Number.isSafeInteger(equipmentId) || equipmentId < 1 || !issueDescription || issueDescription.length > 2000) {
+        return res.status(400).json({ message: "Select one equipment unit and describe the issue (up to 2000 characters)." });
+    }
+
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not submit the maintenance complaint." });
+        connection.beginTransaction(beginError => {
+            if (beginError) {
+                connection.release();
+                return res.status(500).json({ message: "Could not start the complaint transaction." });
+            }
+            connection.query(
+                "SELECT equipment_id, equipment_code FROM equipment WHERE equipment_id = ? FOR UPDATE",
+                [equipmentId],
+                (lookupError, units) => {
+                    if (lookupError || !units.length) {
+                        return connection.rollback(() => {
+                            connection.release();
+                            res.status(lookupError ? 500 : 404).json({ message: lookupError ? "Could not verify the equipment unit." : "Equipment unit not found." });
+                        });
+                    }
+                    connection.query(
+                        "INSERT INTO complaints (user_id, equipment_id, issue_description, status) VALUES (?, ?, ?, 'PENDING')",
+                        [userId, equipmentId, issueDescription],
+                        insertError => {
+                            if (insertError) {
+                                return connection.rollback(() => {
+                                    connection.release();
+                                    res.status(500).json({ message: "Could not save the maintenance complaint." });
+                                });
+                            }
+                            connection.query(
+                                "UPDATE equipment SET status = 'MAINTENANCE', available_quantity = 0 WHERE equipment_id = ?",
+                                [equipmentId],
+                                updateError => {
+                                    if (updateError) {
+                                        return connection.rollback(() => {
+                                            connection.release();
+                                            res.status(500).json({ message: "Could not mark the reported unit for maintenance." });
+                                        });
+                                    }
+                                    connection.commit(commitError => {
+                                        connection.release();
+                                        if (commitError) return res.status(500).json({ message: "Could not complete the complaint submission." });
+                                        res.status(201).json({
+                                            message: "Complaint submitted for " + units[0].equipment_code + ". Only this equipment unit was marked for maintenance."
+                                        });
+                                    });
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+        });
+    });
+});
+
+// Students can only see their own complaints and statuses.
+app.get("/api/my-complaints", authenticateToken, (req, res) => {
+    const sql = "SELECT c.complaint_id,c.issue_description,c.status,c.created_at,e.equipment_code,e.name AS equipment_name FROM complaints c LEFT JOIN equipment e ON e.equipment_id=c.equipment_id WHERE c.user_id=? ORDER BY c.complaint_id DESC";
+    db.query(sql, [req.user.user_id], (err, rows) => {
+        if (err) return res.status(500).json({ message: "Could not load your complaint history." });
+        res.json(rows);
+    });
+});
+
+// Get All Complaints API (Admin Side)
+app.get("/api/complaints", authenticateToken, requireAdmin, (req, res) => {
+    const sql = `
+        SELECT
+            c.complaint_id,
+            c.issue_description,
+            c.status AS complaint_status,
+            c.created_at,
+            u.name AS student_name,
+            u.student_id,
+            e.equipment_id,
+            e.equipment_code,
+            e.name AS equipment_name,
+            e.status AS equipment_status
+        FROM complaints c
+        LEFT JOIN users u ON c.user_id = u.user_id
+        LEFT JOIN equipment e ON c.equipment_id = e.equipment_id
+        ORDER BY c.complaint_id DESC
+    `;
+
+    db.query(sql, (err, results) => {
+        if (err) {
+            console.error("Get complaints warning:", err.message);
+            // Return empty list safely if table doesn't exist yet
+            return res.json([]);
+        }
+
+        res.json(results);
+    });
+});
+
+// Resolve one maintenance complaint without releasing other units or active loans.
+app.put("/api/complaints/:id/resolve", authenticateToken, requireAdmin, (req, res) => {
+    const complaintId = Number(req.params.id);
+    const makeAvailable = req.body?.make_available !== false;
+    if (!Number.isSafeInteger(complaintId) || complaintId < 1) {
+        return res.status(400).json({ message: "Invalid complaint ID." });
+    }
+
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not resolve maintenance request." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start maintenance resolution." }); }
+            connection.query(
+                "SELECT complaint_id, equipment_id, status FROM complaints WHERE complaint_id = ? FOR UPDATE",
+                [complaintId],
+                (lookupError, complaints) => {
+                    if (lookupError || !complaints.length) {
+                        return connection.rollback(() => { connection.release(); res.status(lookupError ? 500 : 404).json({ message: lookupError ? "Could not load complaint." : "Maintenance complaint not found." }); });
+                    }
+                    const complaint = complaints[0];
+                    connection.query(
+                        "UPDATE complaints SET status = 'RESOLVED' WHERE complaint_id = ?",
+                        [complaintId],
+                        updateError => {
+                            if (updateError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not resolve complaint." }); });
+                            const finish = () => connection.commit(commitError => {
+                                connection.release();
+                                if (commitError) return res.status(500).json({ message: "Could not save maintenance resolution." });
+                                res.json({ message: makeAvailable ? "Complaint resolved. Equipment availability was checked safely." : "Complaint resolved; equipment remains unavailable." });
+                            });
+                            if (!makeAvailable || !complaint.equipment_id) return finish();
+                            connection.query(
+                                "SELECT COUNT(*) AS active_count FROM transactions WHERE equipment_id = ? AND status = 'ACTIVE'",
+                                [complaint.equipment_id],
+                                (activeError, activeRows) => {
+                                    if (activeError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not verify active loans." }); });
+                                    connection.query(
+                                        "SELECT COUNT(*) AS open_count FROM complaints WHERE equipment_id = ? AND status NOT IN ('RESOLVED','REJECTED')",
+                                        [complaint.equipment_id],
+                                        (openError, openRows) => {
+                                            if (openError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not verify other maintenance reports." }); });
+                                            const activeCount = Number(activeRows[0]?.active_count || 0);
+                                            const openCount = Number(openRows[0]?.open_count || 0);
+                                            if (activeCount === 0 && openCount === 0) {
+                                                connection.query(
+                                                    "UPDATE equipment SET status = 'AVAILABLE', available_quantity = GREATEST(COALESCE(available_quantity, 0), 1) WHERE equipment_id = ? AND status = 'MAINTENANCE'",
+                                                    [complaint.equipment_id],
+                                                    releaseError => {
+                                                        if (releaseError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not restore equipment availability." }); });
+                                                        finish();
+                                                    }
+                                                );
+                                            } else {
+                                                finish();
+                                            }
+                                        }
+                                    );
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+        });
+    });
+});
+
+// Multi-item checkout QR workflow. Run backend/migrations/20261015_checkout_qr.sql first.
+const hashQrToken = value => crypto.createHash("sha256").update(String(value)).digest("hex");
+
+app.post("/api/checkout-requests", authenticateToken, (req, res) => {
+    // Preferred payload: items: [{ equipment_id, quantity }]. Legacy equipment_ids remains supported.
+    const rawItems = Array.isArray(req.body && req.body.items)
+        ? req.body.items
+        : Array.isArray(req.body && req.body.equipment_ids)
+            ? req.body.equipment_ids.map(equipment_id => ({ equipment_id, quantity: 1 }))
+            : null;
+    if (!rawItems || rawItems.length < 1 || rawItems.length > 25) {
+        return res.status(400).json({ message: "Select 1–25 equipment types for checkout." });
+    }
+    const items = rawItems.map(item => ({
+        equipment_id: Number(item && item.equipment_id),
+        quantity: Number(item && item.quantity)
+    }));
+    const ids = items.map(item => item.equipment_id);
+    if (ids.some(id => !Number.isSafeInteger(id) || id <= 0) ||
+        items.some(item => item.quantity !== 1) ||
+        new Set(ids).size !== ids.length) {
+        return res.status(400).json({ message: "Each selected physical unit must have quantity 1. Select separate equipment codes for separate units." });
+    }
+    const token = crypto.randomBytes(32).toString("hex");
+    const tokenHash = hashQrToken(token);
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Checkout request is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start checkout request." }); }
+            connection.query("SELECT equipment_id, name, equipment_code, status, COALESCE(available_quantity, 1) AS available_quantity FROM equipment WHERE equipment_id IN (?) FOR UPDATE", [ids], (selectError, rows) => {
+                if (selectError || rows.length !== ids.length) {
+                    return connection.rollback(() => { connection.release(); res.status(selectError ? 500 : 400).json({ message: selectError ? "Could not validate equipment." : "One or more selected items no longer exist." }); });
+                }
+                const byId = new Map(rows.map(row => [Number(row.equipment_id), row]));
+                const unavailable = items.filter(item => {
+                    const equipment = byId.get(item.equipment_id);
+                    return !equipment || String(equipment.status || "").toUpperCase() !== "AVAILABLE" || Number(equipment.available_quantity) < item.quantity;
+                }).map(item => {
+                    const equipment = byId.get(item.equipment_id);
+                    return { equipment_code: equipment?.equipment_code || String(item.equipment_id), requested: item.quantity, available: Number(equipment?.available_quantity || 0) };
+                });
+                if (items.some(item => item.quantity !== 1)) {
+                    return connection.rollback(() => { connection.release(); res.status(400).json({ message: "Select individual physical unit records. Each equipment ID can be requested once." }); });
+                }
+                if (unavailable.length) {
+                    return connection.rollback(() => { connection.release(); res.status(409).json({ message: "One or more selected physical units are unavailable. Refresh inventory and try again.", unavailable }); });
+                }
+                connection.query("INSERT INTO checkout_requests (user_id, token_hash, status) VALUES (?, ?, 'PENDING')", [req.user.user_id, tokenHash], (insertError, result) => {
+                    if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create checkout request. Apply the reviewed quantity/return migration first." }); });
+                    const values = items.map(item => [result.insertId, item.equipment_id, item.quantity]);
+                    connection.query("INSERT INTO checkout_request_items (request_id, equipment_id, quantity) VALUES ?", [values], itemError => {
+                        if (itemError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not save the selected quantities. Check that the quantity migration is applied." }); });
+                        connection.commit(commitError => {
+                            connection.release();
+                            if (commitError) return res.status(500).json({ message: "Could not save checkout request." });
+                            res.status(201).json({ message: "Checkout QR request created. Show this QR to the lab administrator.", request_id: result.insertId, token, status: "PENDING", items: items.map(item => { const equipment = byId.get(item.equipment_id); return { equipment_id: item.equipment_id, equipment_code: equipment.equipment_code, name: equipment.name, quantity: item.quantity }; }) });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
+// Let a student check whether their checkout QR has been accepted by the administrator.
+app.get("/api/checkout-requests/:requestId", authenticateToken, (req, res) => {
+    const requestId = Number(req.params.requestId);
+    if (!Number.isSafeInteger(requestId) || requestId < 1) {
+        return res.status(400).json({ message: "Invalid checkout request ID." });
+    }
+    const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
+    const sql = "SELECT request_id, user_id, status, created_at, issued_at FROM checkout_requests WHERE request_id = ?" +
+        (isAdmin ? "" : " AND user_id = ?") + " LIMIT 1";
+    const params = isAdmin ? [requestId] : [requestId, req.user.user_id];
+    db.query(sql, params, (err, rows) => {
+        if (err) {
+            console.error("Checkout request status lookup failed:", err.message);
+            return res.status(500).json({ message: "Could not load checkout request status." });
+        }
+        if (!rows.length) return res.status(404).json({ message: "Checkout request not found." });
+        const request = rows[0];
+        return res.json({
+            request: {
+                request_id: request.request_id,
+                status: request.status,
+                created_at: request.created_at,
+                issued_at: request.issued_at
+            }
+        });
+    });
+});
+
+app.post("/api/admin/checkout-requests/scan", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid checkout QR token is required." });
+    db.query("SELECT r.request_id, r.status, r.created_at, u.user_id, u.name AS student_name, u.student_id FROM checkout_requests r JOIN users u ON u.user_id = r.user_id WHERE r.token_hash = ? LIMIT 1", [hashQrToken(token)], (err, requests) => {
+        if (err) return res.status(500).json({ message: "Could not verify QR request. Ensure the QR migration is applied." });
+        if (!requests.length) return res.status(404).json({ message: "QR token not found." });
+        const request = requests[0];
+        if (request.status !== "PENDING") return res.status(409).json({ message: "This QR request has already been used or cancelled.", status: request.status });
+        db.query("SELECT e.equipment_id, e.equipment_code, e.name, e.status, COALESCE(e.available_quantity, 1) AS available_quantity, COALESCE(i.quantity, 1) AS quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? ORDER BY i.request_item_id", [request.request_id], (itemError, items) => {
+            if (itemError) return res.status(500).json({ message: "Could not load requested equipment." });
+            res.json({ request: { request_id: request.request_id, status: request.status, created_at: request.created_at }, student: { user_id: request.user_id, name: request.student_name, student_id: request.student_id }, items });
+        });
+    });
+});
+
+app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid checkout QR token is required." });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Issue operation is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start issue operation." }); }
+            connection.query("SELECT request_id, user_id, status FROM checkout_requests WHERE token_hash = ? FOR UPDATE", [hashQrToken(token)], (requestError, requests) => {
+                if (requestError || !requests.length) return connection.rollback(() => { connection.release(); res.status(requestError ? 500 : 404).json({ message: requestError ? "Could not verify checkout request." : "QR token not found." }); });
+                const request = requests[0];
+                if (request.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This QR has already been used or cancelled.", status: request.status }); });
+                connection.query("SELECT e.equipment_id, e.equipment_code, e.status, COALESCE(e.available_quantity, 1) AS available_quantity, COALESCE(i.quantity, 1) AS quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? FOR UPDATE", [request.request_id], (itemsError, items) => {
+                    if (itemsError || !items.length) return connection.rollback(() => { connection.release(); res.status(itemsError ? 500 : 400).json({ message: "No equipment found in this checkout request." }); });
+                    if (items.some(item => String(item.status).toUpperCase() !== "AVAILABLE" || Number(item.available_quantity) < 1 || Number(item.quantity || 1) !== 1)) {
+                        return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Each checkout request must identify one available physical unit. Refresh inventory and select individual unit codes." }); });
+                    }
+                    const transactionRows = items.map(item => [request.user_id, item.equipment_id, "ACTIVE"]);
+                    connection.query("INSERT INTO transactions (user_id, equipment_id, status, checkout_request_id) VALUES ?", [transactionRows.map(row => [row[0],row[1],row[2],request.request_id])], insertError => {
+                        if (insertError) { console.error("[checkout issue] transaction insert failed:", insertError.code || "UNKNOWN", insertError.message || "No database error message"); return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); }); }
+                        let remaining = items.length;
+                        let updateFailed = false;
+                        items.forEach(item => {
+                            connection.query("UPDATE equipment SET available_quantity = 0, status = 'IN_USE' WHERE equipment_id = ? AND status = 'AVAILABLE' AND COALESCE(available_quantity, 1) >= 1", [item.equipment_id], (updateError, updateResult) => {
+                                if (updateError || updateResult.affectedRows !== 1) updateFailed = true;
+                                remaining--;
+                                if (remaining !== 0) return;
+                                if (updateFailed) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Stock changed while issuing. No issue was saved; refresh and retry." }); });
+                                connection.query("UPDATE checkout_requests SET status = 'ISSUED', issued_at = NOW(), issued_by = ? WHERE request_id = ? AND status = 'PENDING'", [req.user.user_id, request.request_id], (markError, result) => {
+                                    if (markError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Checkout request state changed. No issue was saved." }); });
+                                    connection.commit(commitError => {
+                                        connection.release();
+                                        if (commitError) return res.status(500).json({ message: "Issue could not be committed. Check transaction history before retrying." });
+                                        res.json({ message: "Equipment issued successfully.", request_id: request.request_id, equipment: items.map(item => ({ equipment_id: item.equipment_id, equipment_code: item.equipment_code, quantity: Number(item.quantity || 1) })), total_units: transactionRows.length });
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
+// Legacy quantity-based checkout is disabled. Use the individual-unit QR workflow.
+app.post("/api/checkout", authenticateToken, (req, res) => {
+    return res.status(410).json({
+        message: "This quantity-based checkout endpoint is retired. Create a QR request for individual equipment units."
+    });
+});
+
+// Student creates a one-time return QR for an active transaction.
+// Batch return requests support selecting any subset of active unit-level transactions.
+app.post("/api/return-requests", authenticateToken, (req, res) => {
+    const raw = req.body && req.body.transaction_ids;
+    if (!Array.isArray(raw) || raw.length < 1 || raw.length > 25) return res.status(400).json({ message: "Select 1–25 borrowed units to return." });
+    const ids = raw.map(Number);
+    if (ids.some(id => !Number.isSafeInteger(id) || id < 1) || new Set(ids).size !== ids.length) return res.status(400).json({ message: "Return selection contains invalid or duplicate transaction IDs." });
+    const token = crypto.randomBytes(32).toString("hex");
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Return request is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start return request." }); }
+            connection.query("SELECT t.transaction_id,t.user_id,t.equipment_id,t.status,e.equipment_code,e.name AS equipment_name FROM transactions t JOIN equipment e ON e.equipment_id=t.equipment_id WHERE t.transaction_id IN (?) FOR UPDATE", [ids], (selectError, rows) => {
+                if (selectError || rows.length !== ids.length) return connection.rollback(() => { connection.release(); res.status(selectError ? 500 : 404).json({ message: "One or more selected loans could not be found." }); });
+                if (rows.some(row => Number(row.user_id) !== Number(req.user.user_id) && String(req.user.role).toLowerCase() !== "admin")) return connection.rollback(() => { connection.release(); res.status(403).json({ message: "You can only return your own borrowed equipment." }); });
+                if (rows.some(row => row.status !== "ACTIVE")) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "One or more selected units are no longer outstanding." }); });
+                connection.query("INSERT INTO return_sessions (user_id,token_hash,status) VALUES (?,?,'PENDING')", [req.user.user_id, hashQrToken(token)], (insertError, result) => {
+                    if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create return session. Apply the reviewed quantity/return migration first." }); });
+                    connection.query("INSERT INTO return_session_items (return_session_id,transaction_id) VALUES ?", [ids.map(id => [result.insertId,id])], itemError => {
+                        if (itemError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not save return selection." }); });
+                        connection.commit(commitError => { connection.release(); if (commitError) return res.status(500).json({ message: "Could not save return request." }); res.status(201).json({ message: "Return QR created for the selected units.", return_session_id: result.insertId, token, items: rows.map(row => ({ transaction_id: row.transaction_id, equipment_code: row.equipment_code, equipment_name: row.equipment_name })) }); });
+                    });
+                });
+            });
+        });
+    });
+});
+
+app.post("/api/admin/return-requests/scan", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid return QR token is required." });
+    db.query("SELECT s.return_session_id,s.user_id,s.status,s.created_at,u.name AS student_name,u.student_id FROM return_sessions s JOIN users u ON u.user_id=s.user_id WHERE s.token_hash=? LIMIT 1", [hashQrToken(token)], (err, sessions) => {
+        if (err) return res.status(500).json({ message: "Could not verify return QR. Apply the reviewed quantity/return migration first." });
+        if (!sessions.length) return res.status(404).json({ message: "Return QR not found." });
+        const session = sessions[0];
+        if (session.status !== "PENDING") return res.status(409).json({ message: "This return QR has already been processed.", status: session.status });
+        db.query("SELECT i.transaction_id,i.condition_status,t.equipment_id,e.equipment_code,e.name AS equipment_name,t.status AS transaction_status FROM return_session_items i JOIN transactions t ON t.transaction_id=i.transaction_id JOIN equipment e ON e.equipment_id=t.equipment_id WHERE i.return_session_id=? ORDER BY i.return_session_item_id", [session.return_session_id], (itemError, items) => {
+            if (itemError) return res.status(500).json({ message: "Could not load return items." });
+            if (items.some(item => item.transaction_status !== "ACTIVE")) return res.status(409).json({ message: "A selected unit is no longer outstanding. Create a new return request." });
+            res.json({ session: { return_session_id: session.return_session_id, status: session.status, created_at: session.created_at }, student: { user_id: session.user_id, name: session.student_name, student_id: session.student_id }, items });
+        });
+    });
+});
+
+app.post("/api/admin/return-requests/confirm", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid return QR token is required." });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Return confirmation is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start return confirmation." }); }
+            connection.query("SELECT return_session_id,user_id,status FROM return_sessions WHERE token_hash=? FOR UPDATE", [hashQrToken(token)], (sessionError, sessions) => {
+                if (sessionError || !sessions.length) return connection.rollback(() => { connection.release(); res.status(sessionError ? 500 : 404).json({ message: "Return QR not found." }); });
+                const session = sessions[0];
+                if (session.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This return QR has already been processed." }); });
+                connection.query("SELECT i.return_session_item_id,i.transaction_id,COALESCE(i.condition_status,'GOOD') AS condition_status,i.condition_notes,t.equipment_id,t.status AS transaction_status FROM return_session_items i JOIN transactions t ON t.transaction_id=i.transaction_id WHERE i.return_session_id=? FOR UPDATE", [session.return_session_id], (itemsError, items) => {
+                    if (itemsError || !items.length) return connection.rollback(() => { connection.release(); res.status(itemsError ? 500 : 400).json({ message: "No return items were found." }); });
+                    if (items.some(item => item.transaction_status !== "ACTIVE")) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "A selected unit is no longer outstanding." }); });
+                    let index = 0, failed = false;
+                    const next = () => {
+                        if (index >= items.length) {
+                            if (failed) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Return was not saved. No inventory changes were committed." }); });
+                            connection.query("UPDATE return_sessions SET status='CONFIRMED',confirmed_at=NOW(),confirmed_by=? WHERE return_session_id=? AND status='PENDING'", [req.user.user_id,session.return_session_id], (markError, result) => {
+                                if (markError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return session state changed." }); });
+                                connection.commit(commitError => { connection.release(); if (commitError) return res.status(500).json({ message: "Return commit failed. Check transaction history before retrying." }); res.json({ message: "Selected equipment returned successfully.", returned_units: items.length }); });
+                            });
+                            return;
+                        }
+                        const item = items[index++];
+                        connection.query("UPDATE transactions SET status='RETURNED',return_time=NOW() WHERE transaction_id=? AND status='ACTIVE'", [item.transaction_id], (txError, txResult) => {
+                            if (txError || txResult.affectedRows !== 1) { failed = true; return next(); }
+                            const damaged = item.condition_status === "DAMAGED" || item.condition_status === "MISSING_PARTS";
+                            const stockSql = damaged
+                                ? "UPDATE equipment SET status='MAINTENANCE', available_quantity=0 WHERE equipment_id=?"
+                                : "UPDATE equipment SET status=CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id=equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) THEN 'MAINTENANCE' WHEN EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id=equipment.equipment_id AND t.status='ACTIVE') THEN 'IN_USE' ELSE 'AVAILABLE' END, available_quantity=CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id=equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) OR EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id=equipment.equipment_id AND t.status='ACTIVE') THEN 0 ELSE 1 END WHERE equipment_id=?";
+                            connection.query(stockSql, [item.equipment_id], stockError => {
+                                if (stockError) { failed = true; return next(); }
+                                connection.query("INSERT INTO equipment_condition_reports (transaction_id,equipment_id,user_id,return_session_id,condition_status,notes) VALUES (?,?,?,?,?,?)", [item.transaction_id,item.equipment_id,session.user_id,session.return_session_id,item.condition_status,item.condition_notes||null], reportError => {
+                                    if (reportError) { failed = true; return next(); }
+                                    connection.query("UPDATE return_session_items SET processed_at=NOW() WHERE return_session_item_id=?", [item.return_session_item_id], () => next());
+                                });
+                            });
+                        });
+                    };
+                    next();
+                });
+            });
+        });
+    });
+});
+
+app.post("/api/return-qr", authenticateToken, (req, res) => {
+    const transactionId = Number((req.body || {}).transaction_id);
+    if (!Number.isInteger(transactionId) || transactionId < 1) return res.status(400).json({ message: "A valid transaction ID is required." });
+    const token = crypto.randomBytes(32).toString("hex");
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Return QR is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start return request." }); }
+            connection.query("SELECT transaction_id, user_id, equipment_id, status FROM transactions WHERE transaction_id = ? FOR UPDATE", [transactionId], (err, rows) => {
+                if (err || !rows.length) return connection.rollback(() => { connection.release(); res.status(err ? 500 : 404).json({ message: err ? "Could not load transaction." : "Transaction not found." }); });
+                const tx = rows[0];
+                if (String(req.user.role).toLowerCase() !== "admin" && Number(tx.user_id) !== Number(req.user.user_id)) return connection.rollback(() => { connection.release(); res.status(403).json({ message: "You can only create a return QR for your own loan." }); });
+                if (tx.status !== "ACTIVE") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This transaction is not active." }); });
+                connection.query("SELECT return_token_id FROM return_qr_tokens WHERE transaction_id = ? AND status = 'PENDING' LIMIT 1", [transactionId], (checkErr, existing) => {
+                    if (checkErr) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not check existing return requests." }); });
+                    if (existing.length) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "A pending return QR already exists for this transaction." }); });
+                    connection.query("INSERT INTO return_qr_tokens (transaction_id, token_hash, status) VALUES (?, ?, 'PENDING')", [transactionId, hashQrToken(token)], insertErr => {
+                        if (insertErr) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create return QR. Ensure the QR migration is applied." }); });
+                        connection.commit(commitErr => { connection.release(); if (commitErr) return res.status(500).json({ message: "Could not save return QR." }); res.status(201).json({ message: "Return QR created. Show it to the lab administrator.", token, transaction_id: transactionId }); });
+                    });
+                });
+            });
+        });
+    });
+});
+
+// Admin scans/validates a return QR; no inventory changes until confirm.
+app.post("/api/admin/return-qr/scan", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid return QR token is required." });
+    db.query("SELECT rt.return_token_id, rt.status AS token_status, t.transaction_id, t.user_id, t.equipment_id, t.status AS transaction_status, u.name AS student_name, u.student_id, e.equipment_code, e.name AS equipment_name FROM return_qr_tokens rt JOIN transactions t ON t.transaction_id = rt.transaction_id JOIN users u ON u.user_id = t.user_id JOIN equipment e ON e.equipment_id = t.equipment_id WHERE rt.token_hash = ? LIMIT 1", [hashQrToken(token)], (err, rows) => {
+        if (err) return res.status(500).json({ message: "Could not verify return QR. Ensure the QR migration is applied." });
+        if (!rows.length) return res.status(404).json({ message: "Return QR token not found." });
+        const row = rows[0];
+        if (row.token_status !== "PENDING" || row.transaction_status !== "ACTIVE") return res.status(409).json({ message: "This return QR has already been used or the loan is no longer active." });
+        res.json({ student: { name: row.student_name, student_id: row.student_id }, item: { transaction_id: row.transaction_id, equipment_id: row.equipment_id, equipment_code: row.equipment_code, name: row.equipment_name }, status: "PENDING" });
+    });
+});
+
+// Admin confirms a scanned return QR. Token use, transaction status and stock update are atomic.
+app.post("/api/admin/return-qr/confirm", authenticateToken, requireAdmin, (req, res) => {
+    const token = String((req.body || {}).token || "").trim();
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "A valid return QR token is required." });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Return confirmation is temporarily unavailable." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start return confirmation." }); }
+            connection.query("SELECT return_token_id, transaction_id, status FROM return_qr_tokens WHERE token_hash = ? FOR UPDATE", [hashQrToken(token)], (tokenError, tokens) => {
+                if (tokenError || !tokens.length) return connection.rollback(() => { connection.release(); res.status(tokenError ? 500 : 404).json({ message: tokenError ? "Could not validate token." : "Return QR token not found." }); });
+                const qr = tokens[0];
+                if (qr.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This return QR has already been used." }); });
+                connection.query("SELECT transaction_id, equipment_id, status FROM transactions WHERE transaction_id = ? FOR UPDATE", [qr.transaction_id], (txError, txs) => {
+                    if (txError || !txs.length || txs[0].status !== "ACTIVE") return connection.rollback(() => { connection.release(); res.status(txError ? 500 : 409).json({ message: "The loan is no longer active." }); });
+                    const tx = txs[0];
+                    connection.query("UPDATE transactions SET status = 'RETURNED', return_time = NOW() WHERE transaction_id = ? AND status = 'ACTIVE'", [tx.transaction_id], (updateTxError, result) => {
+                        if (updateTxError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return was not recorded." }); });
+                        connection.query("UPDATE equipment SET available_quantity = LEAST(COALESCE(total_quantity, 50), COALESCE(available_quantity, 0) + 1), status = 'AVAILABLE' WHERE equipment_id = ?", [tx.equipment_id], stockError => {
+                            if (stockError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not update available stock." }); });
+                            connection.query("UPDATE return_qr_tokens SET status = 'USED', used_at = NOW(), used_by = ? WHERE return_token_id = ? AND status = 'PENDING'", [req.user.user_id, qr.return_token_id], (markError, markResult) => {
+                                if (markError || markResult.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return QR was already consumed." }); });
+                                connection.commit(commitError => { connection.release(); if (commitError) return res.status(500).json({ message: "Could not commit return. Check transaction history before retrying." }); res.json({ message: "Equipment return confirmed successfully.", transaction_id: tx.transaction_id }); });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
+// Legacy quantity-based return is disabled. Use transaction-specific return QR confirmation.
+app.post("/api/return", authenticateToken, (req, res) => {
+    return res.status(410).json({
+        message: "This quantity-based return endpoint is retired. Create a return QR for the exact active transaction."
+    });
+});
+
+app.get("/api/transactions/user/:user_id", authenticateToken, (req, res) => {
+    const requestedUserId = String(req.params.user_id);
+    const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
+    if (!isAdmin && requestedUserId !== String(req.user.user_id)) {
+        return res.status(403).json({ message: "Transaction access denied." });
+    }
+    const history = String(req.query.history || "").toLowerCase() === "true";
+    const statusClause = history ? "" : "AND t.status = 'ACTIVE'";
+    const sql = "SELECT t.transaction_id, t.equipment_id, e.equipment_code, e.name AS equipment_name, t.checkout_time, t.return_time, t.status " +
+        "FROM transactions t LEFT JOIN equipment e ON e.equipment_id = t.equipment_id WHERE t.user_id = ? " + statusClause +
+        " ORDER BY t.transaction_id DESC";
+    db.query(sql, [requestedUserId], (err, results) => {
+        if (err) {
+            console.error("User transactions request failed:", err.message);
+            return res.status(500).json({ message: "Could not load transactions." });
+        }
+        res.json(results);
+    });
+});
+
+// Transaction history API
+app.get("/api/transactions", authenticateToken, requireAdmin, (req, res) => {
+    console.log("API /api/transactions requested");
+    const sql = `
+        SELECT
+            t.transaction_id,
+            u.name AS student_name,
+            u.student_id,
+            e.equipment_code,
+            e.name AS equipment_name,
+            t.checkout_time,
+            t.return_time,
+            t.status
+        FROM transactions t
+        LEFT JOIN users u ON t.user_id = u.user_id
+        LEFT JOIN equipment e ON t.equipment_id = e.equipment_id
+        ORDER BY t.transaction_id DESC
+    `;
+
+    db.query(sql, (err, results) => {
+        if (err) {
+            console.error("Database error in /api/transactions:", err.message);
+            return res.status(500).json({ error: err.message });
+        }
+
+        console.log(`Found ${results.length} transactions`);
+        res.json(results);
+    });
+});
+
+// Admin API: Get student account details & transaction history by student_id
+app.get("/api/admin/student/:student_id", authenticateToken, requireAdmin, (req, res) => {
+    const studentId = req.params.student_id;
+
+    const userSql = "SELECT user_id, name, student_id, email, role FROM users WHERE student_id = ?";
+
+    db.query(userSql, [studentId], (err, users) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+
+        if (users.length === 0) {
+            return res.status(404).json({ message: "Student not found with ID: " + studentId });
+        }
+
+        const user = users[0];
+
+        const txSql = `
+            SELECT
+                t.transaction_id,
+                e.equipment_id,
+                e.equipment_code,
+                e.name AS equipment_name,
+                t.checkout_time,
+                t.return_time,
+                t.status
+            FROM transactions t
+            LEFT JOIN equipment e ON t.equipment_id = e.equipment_id
+            WHERE t.user_id = ?
+            ORDER BY t.transaction_id DESC
+        `;
+
+        db.query(txSql, [user.user_id], (err, transactions) => {
+            if (err) {
+                return res.status(500).json({ error: err.message });
+            }
+
+            res.json({
+                student: user,
+                transactions: transactions
+            });
+        });
+    });
+});
+
+// Start server — keep this at the bottom
+const PORT = Number(process.env.PORT) || 3000;
+
 app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
     const { equipment_code, name, category, calibration_limit } = req.body || {};
     const quantity = Number(req.body?.total_quantity ?? 1);
@@ -287,11 +1059,12 @@ app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
         return res.status(400).json({ message: "Quantity must be a whole number between 1 and 1000." });
     }
     const baseCode = String(equipment_code).trim();
-    
+    const baseRfid = String(rfid_tag || "").trim() || null;
     const limit = Number(calibration_limit) > 0 ? Number(calibration_limit) : 500;
     const values = Array.from({ length: quantity }, (_, index) => {
         const suffix = String(index + 1).padStart(3, "0");
         const code = quantity === 1 ? baseCode : baseCode + "-" + suffix;
+        const rfid = index === 0 ? baseRfid : null;
         return [code, name, category, crypto.randomBytes(16).toString("hex"), limit];
     });
     db.getConnection((connectionError, connection) => {
@@ -300,7 +1073,7 @@ app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
             if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start equipment creation." }); }
             connection.query(
                 "INSERT INTO equipment (equipment_code,name,category,qr_token,status,runtime_hours,calibration_limit,total_quantity,available_quantity) VALUES ?",
-                [values.map(row => [...row, "AVAILABLE", 0, row[4], 1, 1])],
+                [values.map(row => [...row, "AVAILABLE", 0, row[5], 1, 1])],
                 (insertError, result) => {
                     if (insertError) return connection.rollback(() => {
                         connection.release();
