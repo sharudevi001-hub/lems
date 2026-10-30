@@ -118,7 +118,7 @@ app.get("/health", (req, res) => {
 // Resolve an opaque equipment QR token after the user is authenticated.
 app.get("/api/equipment/qr/:token", authenticateToken, (req, res) => {
     const token = String(req.params.token || "").trim();
-    if (!/^[a-f0-9]{32}$/i.test(token)) return res.status(400).json({ message: "Invalid equipment QR token." });
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).json({ message: "Invalid equipment QR token." });
     db.query("SELECT equipment_id, equipment_code, name, category, status, COALESCE(available_quantity,1) AS available_quantity, COALESCE(total_quantity,1) AS total_quantity FROM equipment WHERE qr_token = ? LIMIT 1", [token], (err, rows) => {
         if (err) return res.status(500).json({ message: "Could not resolve equipment QR. Apply the reviewed equipment QR migration first." });
         if (!rows.length) return res.status(404).json({ message: "Equipment QR was not found." });
