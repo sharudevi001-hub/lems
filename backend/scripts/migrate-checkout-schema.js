@@ -41,6 +41,55 @@ async function main() {
       if (!tableNames.has(requiredTable)) throw new Error("Required table is missing: " + requiredTable + ". Apply the base LEMS migrations first.");
     }
 
+    // Safety preflight: never enable per-physical-unit checkout while a row still
+    // represents multiple stock units, or while multiple active loans point at one row.
+    // Run this before the first DDL statement because MySQL DDL auto-commits.
+    const [equipmentTableRows] = await connection.execute(
+      "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'equipment' LIMIT 1",
+      [config.database]
+    );
+    if (!equipmentTableRows.length) throw new Error("Required table is missing: equipment.");
+
+    const hasTotalQuantity = await columnExists(connection, "equipment", "total_quantity");
+    const hasAvailableQuantity = await columnExists(connection, "equipment", "available_quantity");
+    if (hasTotalQuantity || hasAvailableQuantity) {
+      const aggregateConditions = [];
+      if (hasTotalQuantity) aggregateConditions.push("COALESCE(total_quantity, 1) > 1");
+      if (hasAvailableQuantity) aggregateConditions.push("COALESCE(available_quantity, 1) > 1");
+      const [aggregateRows] = await connection.query(
+        "SELECT equipment_id, equipment_code, " +
+        (hasTotalQuantity ? "total_quantity" : "NULL AS total_quantity") + ", " +
+        (hasAvailableQuantity ? "available_quantity" : "NULL AS available_quantity") +
+        " FROM equipment WHERE " + aggregateConditions.join(" OR ") + " LIMIT 10"
+      );
+      if (aggregateRows.length) {
+        const sample = aggregateRows.map(row =>
+          String(row.equipment_code || row.equipment_id) +
+          " (total=" + String(row.total_quantity) +
+          ", available=" + String(row.available_quantity) + ")"
+        ).join(", ");
+        throw new Error(
+          "Migration stopped before changing the database: aggregate stock rows were found (" +
+          sample + "). Split and reconcile each physical unit and its active transaction history first."
+        );
+      }
+    }
+
+    const [duplicateActiveLoans] = await connection.query(
+      "SELECT equipment_id, COUNT(*) AS active_count FROM transactions " +
+      "WHERE status = 'ACTIVE' GROUP BY equipment_id HAVING COUNT(*) > 1 LIMIT 10"
+    );
+    if (duplicateActiveLoans.length) {
+      const sample = duplicateActiveLoans.map(row =>
+        "equipment_id=" + row.equipment_id + " active_loans=" + row.active_count
+      ).join(", ");
+      throw new Error(
+        "Migration stopped before changing the database: multiple active loans reference the same equipment row (" +
+        sample + "). Reconcile physical-unit assignments before proceeding."
+      );
+    }
+    console.log("Inventory preflight passed: no aggregate stock rows or duplicate active loans found.");
+
     // Repair core columns expected by the current equipment and student APIs.
     // All changes are conditional and preserve existing inventory and student rows.
     for (const [column, definition] of [
@@ -53,6 +102,20 @@ async function main() {
         console.log("Added equipment." + column);
       } else console.log("equipment." + column + " already exists");
     }
+
+    // RFID is optional for physical units until an RFID sticker is assigned.
+    // Preserve the existing column type/length and unique index while allowing NULL.
+    const [rfidColumns] = await connection.execute(
+      "SELECT COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'equipment' AND COLUMN_NAME = 'rfid_tag' LIMIT 1",
+      [config.database]
+    );
+    if (!rfidColumns.length) throw new Error("Required column equipment.rfid_tag is missing.");
+    if (rfidColumns[0].IS_NULLABLE !== "YES") {
+      const safeType = String(rfidColumns[0].COLUMN_TYPE || "").toUpperCase();
+      if (!/^(VARCHAR|CHAR)\(\d+\)$/.test(safeType)) throw new Error("Unsupported equipment.rfid_tag type; manual review is required before making RFID optional.");
+      await connection.query("ALTER TABLE equipment MODIFY COLUMN rfid_tag " + safeType + " NULL");
+      console.log("Made equipment.rfid_tag optional; RFID can be linked after unit creation.");
+    } else console.log("equipment.rfid_tag already allows NULL");
 
     if (await columnExists(connection, "equipment", "qr_token")) {
       await connection.query("UPDATE equipment SET qr_token = REPLACE(UUID(), '-', '') WHERE qr_token IS NULL OR qr_token = ''");

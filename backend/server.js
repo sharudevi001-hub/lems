@@ -128,17 +128,37 @@ app.get("/api/equipment/qr/:token", authenticateToken, (req, res) => {
     db.query("SELECT equipment_id, equipment_code, name, category, status, COALESCE(available_quantity,1) AS available_quantity, COALESCE(total_quantity,1) AS total_quantity FROM equipment WHERE qr_token = ? LIMIT 1", [token], (err, rows) => {
         if (err) return res.status(500).json({ message: "Could not resolve equipment QR. Apply the reviewed equipment QR migration first." });
         if (!rows.length) return res.status(404).json({ message: "Equipment QR was not found." });
-        res.json({ equipment: rows[0] });
+        const equipment = rows[0];
+        if (String(req.user.role || "").toLowerCase() !== "admin" &&
+            (String(equipment.status || "").toUpperCase() !== "AVAILABLE" || Number(equipment.available_quantity) < 1)) {
+            return res.status(409).json({ message: "This equipment unit is not available for checkout." });
+        }
+        res.json({ equipment });
     });
 });
 
-// Get all equipment
-app.get("/api/equipment", authenticateToken, (req, res) => {
-    db.query("SELECT * FROM equipment", (err, results) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
+// Complaint selection is separate from checkout inventory: students must be
+// able to report a fault against any exact physical unit, including unavailable
+// or currently borrowed units. Only the unit's unique code and name are exposed.
+app.get("/api/equipment/complaint-options", authenticateToken, (req, res) => {
+    db.query(
+        "SELECT equipment_id, equipment_code, name, category, status FROM equipment ORDER BY name, equipment_code",
+        (err, rows) => {
+            if (err) return res.status(500).json({ message: "Could not load equipment complaint options." });
+            res.json(rows);
         }
+    );
+});
 
+// Administrators can review every unit. Students only receive equipment
+// records that are currently eligible for checkout.
+app.get("/api/equipment", authenticateToken, (req, res) => {
+    const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
+    const sql = isAdmin
+        ? "SELECT * FROM equipment ORDER BY name, equipment_code"
+        : "SELECT * FROM equipment WHERE status = 'AVAILABLE' AND COALESCE(available_quantity, 1) > 0 ORDER BY name, equipment_code";
+    db.query(sql, (err, results) => {
+        if (err) return res.status(500).json({ error: err.message });
         res.json(results);
     });
 });
@@ -162,9 +182,9 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         "LOST"
     ];
 
-    if (!equipment_code || !name || !category || !rfid_tag) {
+    if (!equipment_code || !name || !category) {
         return res.status(400).json({
-            message: "Please fill in all required fields."
+            message: "Equipment code, name, and category are required. RFID can be linked later."
         });
     }
 
@@ -174,49 +194,37 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         });
     }
 
-    const sql = `
-        UPDATE equipment
-        SET equipment_code = ?,
-            name = ?,
-            category = ?,
-            rfid_tag = ?,
-            status = ?,
-            calibration_limit = ?,
-            available_quantity = GREATEST(0, ? - (COALESCE(total_quantity, 1) - COALESCE(available_quantity, 1))),
-            total_quantity = ?
-        WHERE equipment_id = ?
-    `;
-
-    const values = [
-        equipment_code,
-        name,
-        category,
-        rfid_tag,
-        status,
-        calibration_limit || 500,
-        Number.isSafeInteger(Number(total_quantity)) && Number(total_quantity) >= 1 ? Number(total_quantity) : 1,
-        Number.isSafeInteger(Number(total_quantity)) && Number(total_quantity) >= 1 ? Number(total_quantity) : 1,
-        id
-    ];
-
-    db.query(sql, values, (error, result) => {
-        if (error) {
-            console.error("Update equipment error:", error);
-            return res.status(500).json({
-                message: "Could not update equipment."
-            });
-        }
-
-        if (result.affectedRows === 0) {
-            return res.status(404).json({
-                message: "Equipment not found."
-            });
-        }
-
-        res.json({
-            message: "Equipment updated successfully!"
+    const updateUnit = () => {
+        const sql = `
+            UPDATE equipment
+            SET equipment_code = ?, name = ?, category = ?, rfid_tag = ?,
+                status = ?, calibration_limit = ?,
+                total_quantity = 1,
+                available_quantity = CASE WHEN ? = 'AVAILABLE' THEN 1 ELSE 0 END
+            WHERE equipment_id = ?
+        `;
+        db.query(sql, [equipment_code, name, category, String(rfid_tag || "").trim() || null, status, calibration_limit || 500, status, id], (error, result) => {
+            if (error) {
+                console.error("Update equipment error:", error);
+                return res.status(error.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: error.code === "ER_DUP_ENTRY" ? "Equipment code or RFID tag already exists." : "Could not update equipment." });
+            }
+            if (!result.affectedRows) return res.status(404).json({ message: "Equipment not found." });
+            return res.json({ message: "Individual equipment unit updated successfully." });
         });
-    });
+    };
+
+    if (status !== "AVAILABLE") return updateUnit();
+    db.query(
+        "SELECT (SELECT COUNT(*) FROM transactions WHERE equipment_id = ? AND status = 'ACTIVE') AS active_count, (SELECT COUNT(*) FROM complaints WHERE equipment_id = ? AND status NOT IN ('RESOLVED','REJECTED')) AS open_count",
+        [id, id],
+        (checkError, rows) => {
+            if (checkError) return res.status(500).json({ message: "Could not verify unit availability." });
+            if (Number(rows[0]?.active_count || 0) > 0 || Number(rows[0]?.open_count || 0) > 0) {
+                return res.status(409).json({ message: "This unit has an active loan or unresolved maintenance report. It cannot be marked available." });
+            }
+            updateUnit();
+        }
+    );
 });
 
 // Public self-registration is disabled. Student accounts are created by administrators only.
@@ -519,31 +527,64 @@ app.post("/api/reset-password", loginLimiter, (req, res) => {
 
 // Submit Complaint / Maintenance Request API (Student Side)
 app.post("/api/complaints", authenticateToken, (req, res) => {
-    const { equipment_id, issue_description } = req.body || {};
-    const user_id = req.user.user_id;
+    const equipmentId = Number(req.body?.equipment_id);
+    const issueDescription = String(req.body?.issue_description || "").trim();
+    const userId = req.user.user_id;
 
-    if (!user_id || !equipment_id || !issue_description) {
-        return res.status(400).json({ message: "User ID, Equipment ID, and Issue Description are required." });
+    if (!Number.isSafeInteger(equipmentId) || equipmentId < 1 || !issueDescription || issueDescription.length > 2000) {
+        return res.status(400).json({ message: "Select one equipment unit and describe the issue (up to 2000 characters)." });
     }
 
-    const insertSql = `
-        INSERT INTO complaints (user_id, equipment_id, issue_description, status)
-        VALUES (?, ?, ?, 'PENDING')
-    `;
-
-    db.query(insertSql, [user_id, equipment_id, issue_description.trim()], (err, result) => {
-        if (err) {
-            console.error("Submit complaint error:", err.message);
-            return res.status(500).json({ error: err.message });
-        }
-
-        // Update equipment status to MAINTENANCE
-        db.query("UPDATE equipment SET status = 'MAINTENANCE' WHERE equipment_id = ?", [equipment_id], (err) => {
-            if (err) console.error("Error updating equipment status to MAINTENANCE:", err.message);
-        });
-
-        res.status(201).json({
-            message: "Maintenance complaint submitted successfully! Equipment marked for review."
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not submit the maintenance complaint." });
+        connection.beginTransaction(beginError => {
+            if (beginError) {
+                connection.release();
+                return res.status(500).json({ message: "Could not start the complaint transaction." });
+            }
+            connection.query(
+                "SELECT equipment_id, equipment_code FROM equipment WHERE equipment_id = ? FOR UPDATE",
+                [equipmentId],
+                (lookupError, units) => {
+                    if (lookupError || !units.length) {
+                        return connection.rollback(() => {
+                            connection.release();
+                            res.status(lookupError ? 500 : 404).json({ message: lookupError ? "Could not verify the equipment unit." : "Equipment unit not found." });
+                        });
+                    }
+                    connection.query(
+                        "INSERT INTO complaints (user_id, equipment_id, issue_description, status) VALUES (?, ?, ?, 'PENDING')",
+                        [userId, equipmentId, issueDescription],
+                        insertError => {
+                            if (insertError) {
+                                return connection.rollback(() => {
+                                    connection.release();
+                                    res.status(500).json({ message: "Could not save the maintenance complaint." });
+                                });
+                            }
+                            connection.query(
+                                "UPDATE equipment SET status = 'MAINTENANCE', available_quantity = 0 WHERE equipment_id = ?",
+                                [equipmentId],
+                                updateError => {
+                                    if (updateError) {
+                                        return connection.rollback(() => {
+                                            connection.release();
+                                            res.status(500).json({ message: "Could not mark the reported unit for maintenance." });
+                                        });
+                                    }
+                                    connection.commit(commitError => {
+                                        connection.release();
+                                        if (commitError) return res.status(500).json({ message: "Could not complete the complaint submission." });
+                                        res.status(201).json({
+                                            message: "Complaint submitted for " + units[0].equipment_code + ". Only this equipment unit was marked for maintenance."
+                                        });
+                                    });
+                                }
+                            );
+                        }
+                    );
+                }
+            );
         });
     });
 });
@@ -588,25 +629,70 @@ app.get("/api/complaints", authenticateToken, requireAdmin, (req, res) => {
     });
 });
 
-// Resolve Complaint API (Admin Side)
+// Resolve one maintenance complaint without releasing other units or active loans.
 app.put("/api/complaints/:id/resolve", authenticateToken, requireAdmin, (req, res) => {
-    const complaintId = req.params.id;
-    const { equipment_id, make_available } = req.body;
+    const complaintId = Number(req.params.id);
+    const makeAvailable = req.body?.make_available !== false;
+    if (!Number.isSafeInteger(complaintId) || complaintId < 1) {
+        return res.status(400).json({ message: "Invalid complaint ID." });
+    }
 
-    const updateSql = "UPDATE complaints SET status = 'RESOLVED' WHERE complaint_id = ?";
-    db.query(updateSql, [complaintId], (err, result) => {
-        if (err) {
-            console.error("Resolve complaint error:", err.message);
-            return res.status(500).json({ error: err.message });
-        }
-
-        if (make_available !== false && equipment_id) {
-            db.query("UPDATE equipment SET status = 'AVAILABLE' WHERE equipment_id = ?", [equipment_id], (err) => {
-                if (err) console.error("Error restoring equipment status to AVAILABLE:", err.message);
-            });
-        }
-
-        res.json({ message: "Complaint resolved and equipment status updated!" });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not resolve maintenance request." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start maintenance resolution." }); }
+            connection.query(
+                "SELECT complaint_id, equipment_id, status FROM complaints WHERE complaint_id = ? FOR UPDATE",
+                [complaintId],
+                (lookupError, complaints) => {
+                    if (lookupError || !complaints.length) {
+                        return connection.rollback(() => { connection.release(); res.status(lookupError ? 500 : 404).json({ message: lookupError ? "Could not load complaint." : "Maintenance complaint not found." }); });
+                    }
+                    const complaint = complaints[0];
+                    connection.query(
+                        "UPDATE complaints SET status = 'RESOLVED' WHERE complaint_id = ?",
+                        [complaintId],
+                        updateError => {
+                            if (updateError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not resolve complaint." }); });
+                            const finish = () => connection.commit(commitError => {
+                                connection.release();
+                                if (commitError) return res.status(500).json({ message: "Could not save maintenance resolution." });
+                                res.json({ message: makeAvailable ? "Complaint resolved. Equipment availability was checked safely." : "Complaint resolved; equipment remains unavailable." });
+                            });
+                            if (!makeAvailable || !complaint.equipment_id) return finish();
+                            connection.query(
+                                "SELECT COUNT(*) AS active_count FROM transactions WHERE equipment_id = ? AND status = 'ACTIVE'",
+                                [complaint.equipment_id],
+                                (activeError, activeRows) => {
+                                    if (activeError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not verify active loans." }); });
+                                    connection.query(
+                                        "SELECT COUNT(*) AS open_count FROM complaints WHERE equipment_id = ? AND status NOT IN ('RESOLVED','REJECTED')",
+                                        [complaint.equipment_id],
+                                        (openError, openRows) => {
+                                            if (openError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not verify other maintenance reports." }); });
+                                            const activeCount = Number(activeRows[0]?.active_count || 0);
+                                            const openCount = Number(openRows[0]?.open_count || 0);
+                                            if (activeCount === 0 && openCount === 0) {
+                                                connection.query(
+                                                    "UPDATE equipment SET status = 'AVAILABLE', available_quantity = GREATEST(COALESCE(available_quantity, 0), 1) WHERE equipment_id = ? AND status = 'MAINTENANCE'",
+                                                    [complaint.equipment_id],
+                                                    releaseError => {
+                                                        if (releaseError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not restore equipment availability." }); });
+                                                        finish();
+                                                    }
+                                                );
+                                            } else {
+                                                finish();
+                                            }
+                                        }
+                                    );
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+        });
     });
 });
 
@@ -629,9 +715,9 @@ app.post("/api/checkout-requests", authenticateToken, (req, res) => {
     }));
     const ids = items.map(item => item.equipment_id);
     if (ids.some(id => !Number.isSafeInteger(id) || id <= 0) ||
-        items.some(item => !Number.isSafeInteger(item.quantity) || item.quantity < 1 || item.quantity > 500) ||
+        items.some(item => item.quantity !== 1) ||
         new Set(ids).size !== ids.length) {
-        return res.status(400).json({ message: "Each equipment type must appear once with a whole-number quantity between 1 and 500." });
+        return res.status(400).json({ message: "Each selected physical unit must have quantity 1. Select separate equipment codes for separate units." });
     }
     const token = crypto.randomBytes(32).toString("hex");
     const tokenHash = hashQrToken(token);
@@ -651,8 +737,11 @@ app.post("/api/checkout-requests", authenticateToken, (req, res) => {
                     const equipment = byId.get(item.equipment_id);
                     return { equipment_code: equipment?.equipment_code || String(item.equipment_id), requested: item.quantity, available: Number(equipment?.available_quantity || 0) };
                 });
+                if (items.some(item => item.quantity !== 1)) {
+                    return connection.rollback(() => { connection.release(); res.status(400).json({ message: "Select individual physical unit records. Each equipment ID can be requested once." }); });
+                }
                 if (unavailable.length) {
-                    return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Requested quantity exceeds available stock or equipment is unavailable.", unavailable }); });
+                    return connection.rollback(() => { connection.release(); res.status(409).json({ message: "One or more selected physical units are unavailable. Refresh inventory and try again.", unavailable }); });
                 }
                 connection.query("INSERT INTO checkout_requests (user_id, token_hash, status) VALUES (?, ?, 'PENDING')", [req.user.user_id, tokenHash], (insertError, result) => {
                     if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create checkout request. Apply the reviewed quantity/return migration first." }); });
@@ -727,19 +816,16 @@ app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, 
                 if (request.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This QR has already been used or cancelled.", status: request.status }); });
                 connection.query("SELECT e.equipment_id, e.equipment_code, e.status, COALESCE(e.available_quantity, 1) AS available_quantity, COALESCE(i.quantity, 1) AS quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? FOR UPDATE", [request.request_id], (itemsError, items) => {
                     if (itemsError || !items.length) return connection.rollback(() => { connection.release(); res.status(itemsError ? 500 : 400).json({ message: "No equipment found in this checkout request." }); });
-                    if (items.some(item => String(item.status).toUpperCase() !== "AVAILABLE" || Number(item.available_quantity) < Number(item.quantity || 1))) {
-                        return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Requested stock is no longer available. No equipment was issued; create a new request after refreshing inventory." }); });
+                    if (items.some(item => String(item.status).toUpperCase() !== "AVAILABLE" || Number(item.available_quantity) < 1 || Number(item.quantity || 1) !== 1)) {
+                        return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Each checkout request must identify one available physical unit. Refresh inventory and select individual unit codes." }); });
                     }
-                    const transactionRows = [];
-                    for (const item of items) {
-                        for (let count = 0; count < Number(item.quantity || 1); count++) transactionRows.push([request.user_id, item.equipment_id, "ACTIVE"]);
-                    }
+                    const transactionRows = items.map(item => [request.user_id, item.equipment_id, "ACTIVE"]);
                     connection.query("INSERT INTO transactions (user_id, equipment_id, status, checkout_request_id) VALUES ?", [transactionRows.map(row => [row[0],row[1],row[2],request.request_id])], insertError => {
                         if (insertError) { console.error("[checkout issue] transaction insert failed:", insertError.code || "UNKNOWN", insertError.message || "No database error message"); return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); }); }
                         let remaining = items.length;
                         let updateFailed = false;
                         items.forEach(item => {
-                            connection.query("UPDATE equipment SET available_quantity = GREATEST(0, COALESCE(available_quantity, 1) - ?), status = CASE WHEN COALESCE(available_quantity, 1) - ? <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END WHERE equipment_id = ? AND COALESCE(available_quantity, 1) >= ?", [item.quantity, item.quantity, item.equipment_id, item.quantity], (updateError, updateResult) => {
+                            connection.query("UPDATE equipment SET available_quantity = 0, status = 'IN_USE' WHERE equipment_id = ? AND status = 'AVAILABLE' AND COALESCE(available_quantity, 1) >= 1", [item.equipment_id], (updateError, updateResult) => {
                                 if (updateError || updateResult.affectedRows !== 1) updateFailed = true;
                                 remaining--;
                                 if (remaining !== 0) return;
@@ -761,114 +847,11 @@ app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, 
     });
 });
 
-// Checkout equipment API
+// Legacy quantity-based checkout is disabled. Use the individual-unit QR workflow.
 app.post("/api/checkout", authenticateToken, (req, res) => {
-    if (String(req.user.role || "").toLowerCase() !== "admin") {
-        return res.status(403).json({ message: "Student checkout must use the QR checkout request and admin issue workflow." });
-    }
-
-    const { equipment_id } = req.body || {};
-    const user_id = req.user.user_id;
-
-    if (!user_id || !equipment_id) {
-        return res.status(400).json({
-            message: "User ID and equipment ID are required"
-        });
-    }
-
-    // Check student exists
-    db.query(
-        "SELECT user_id FROM users WHERE user_id = ?",
-        [user_id],
-        (err, users) => {
-            if (err) {
-                return res.status(500).json({ error: err.message });
-            }
-
-            if (users.length === 0) {
-                return res.status(404).json({
-                    message: "Student not found. Please log in again."
-                });
-            }
-
-            // Check if user already has an active checkout for this equipment
-            db.query(
-                "SELECT transaction_id FROM transactions WHERE user_id = ? AND equipment_id = ? AND status = 'ACTIVE'",
-                [user_id, equipment_id],
-                (err, activeTxs) => {
-                    if (err) {
-                        return res.status(500).json({ error: err.message });
-                    }
-
-                    if (activeTxs.length > 0) {
-                        return res.status(400).json({
-                            message: "You already have an active checkout for this equipment. You must return it first."
-                        });
-                    }
-
-                    // Check equipment availability and quantity
-                    db.query(
-                        "SELECT status, COALESCE(available_quantity, 50) AS available_quantity, COALESCE(total_quantity, 50) AS total_quantity FROM equipment WHERE equipment_id = ?",
-                        [equipment_id],
-                        (err, equipment) => {
-                            if (err) {
-                                return res.status(500).json({ error: err.message });
-                            }
-
-                            if (equipment.length === 0) {
-                                return res.status(404).json({
-                                    message: "Equipment not found"
-                                });
-                            }
-
-                            const eq = equipment[0];
-                            if (eq.status === "MAINTENANCE" || eq.status === "LOST" || eq.available_quantity <= 0) {
-                                return res.status(400).json({
-                                    message: "Equipment is out of stock or under maintenance."
-                                });
-                            }
-
-                            // Record checkout
-                            db.query(
-                                `INSERT INTO transactions
-                                 (user_id, equipment_id, status)
-                                 VALUES (?, ?, 'ACTIVE')`,
-                                [user_id, equipment_id],
-                                (err, result) => {
-                                    if (err) {
-                                        return res.status(500).json({ error: err.message });
-                                    }
-
-                                    // Decrement available_quantity and set status to OUT_OF_STOCK if 0
-                                    db.query(
-                                        `UPDATE equipment
-                                         SET available_quantity = GREATEST(0, COALESCE(available_quantity, 50) - 1),
-                                             status = CASE WHEN (COALESCE(available_quantity, 50) - 1) <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END
-                                         WHERE equipment_id = ?`,
-                                        [equipment_id],
-                                        (err, updateResult) => {
-                                            if (err) {
-                                                db.query(
-                                                    `DELETE FROM transactions WHERE transaction_id = ?`,
-                                                    [result.insertId]
-                                                );
-                                                return res.status(500).json({ error: err.message });
-                                            }
-
-                                            res.json({
-                                                message: "Equipment checked out successfully",
-                                                transaction_id: result.insertId
-                                            });
-                                        }
-                                    );
-                                }
-                            );
-                        }
-                    );
-                }
-            );
-        }
-    );
+    return res.status(410).json({
+        message: "This quantity-based checkout endpoint is retired. Create a QR request for individual equipment units."
+    });
 });
 
 // Student creates a one-time return QR for an active transaction.
@@ -944,8 +927,8 @@ app.post("/api/admin/return-requests/confirm", authenticateToken, requireAdmin, 
                             if (txError || txResult.affectedRows !== 1) { failed = true; return next(); }
                             const damaged = item.condition_status === "DAMAGED" || item.condition_status === "MISSING_PARTS";
                             const stockSql = damaged
-                                ? "UPDATE equipment SET status='MAINTENANCE' WHERE equipment_id=?"
-                                : "UPDATE equipment SET available_quantity=LEAST(COALESCE(total_quantity,1),COALESCE(available_quantity,0)+1),status=CASE WHEN COALESCE(available_quantity,0)+1>0 THEN 'AVAILABLE' ELSE status END WHERE equipment_id=?";
+                                ? "UPDATE equipment SET status='MAINTENANCE', available_quantity=0 WHERE equipment_id=?"
+                                : "UPDATE equipment SET status=CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id=equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) THEN 'MAINTENANCE' WHEN EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id=equipment.equipment_id AND t.status='ACTIVE') THEN 'IN_USE' ELSE 'AVAILABLE' END, available_quantity=CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id=equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) OR EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id=equipment.equipment_id AND t.status='ACTIVE') THEN 0 ELSE 1 END WHERE equipment_id=?";
                             connection.query(stockSql, [item.equipment_id], stockError => {
                                 if (stockError) { failed = true; return next(); }
                                 connection.query("INSERT INTO equipment_condition_reports (transaction_id,equipment_id,user_id,return_session_id,condition_status,notes) VALUES (?,?,?,?,?,?)", [item.transaction_id,item.equipment_id,session.user_id,session.return_session_id,item.condition_status,item.condition_notes||null], reportError => {
@@ -1032,80 +1015,10 @@ app.post("/api/admin/return-qr/confirm", authenticateToken, requireAdmin, (req, 
     });
 });
 
-// Return equipment API
+// Legacy quantity-based return is disabled. Use transaction-specific return QR confirmation.
 app.post("/api/return", authenticateToken, (req, res) => {
-    if (String(req.user.role || "").toLowerCase() !== "admin") {
-        return res.status(403).json({ message: "Student returns must use the return QR and admin confirmation workflow." });
-    }
-
-    const { equipment_id } = req.body || {};
-    const currentUserId = req.user.user_id;
-    const isAdministrator = String(req.user.role || "").toLowerCase() === "admin";
-
-    if (!equipment_id) {
-        return res.status(400).json({
-            message: "Equipment ID is required"
-        });
-    }
-
-    const sql = `
-        SELECT transaction_id
-        FROM transactions
-        WHERE equipment_id = ?
-          AND status = 'ACTIVE'
-          AND (? = 1 OR user_id = ?)
-        ORDER BY checkout_time DESC
-        LIMIT 1
-    `;
-
-    db.query(sql, [equipment_id, isAdministrator ? 1 : 0, currentUserId], (err, results) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-
-        if (results.length === 0) {
-            return res.status(400).json({
-                message: "No active checkout found"
-            });
-        }
-
-        const transactionId = results[0].transaction_id;
-
-        db.query(
-            `UPDATE transactions
-             SET status = 'RETURNED', return_time = NOW()
-             WHERE transaction_id = ? AND status = 'ACTIVE'`,
-            [transactionId],
-            (err, result) => {
-                if (err) {
-                    return res.status(500).json({ error: err.message });
-                }
-
-                if (result.affectedRows === 0) {
-                    return res.status(409).json({
-                        message: "This transaction has already been returned"
-                    });
-                }
-
-                // Increment available_quantity and set status to AVAILABLE
-                db.query(
-                    `UPDATE equipment
-                     SET available_quantity = LEAST(COALESCE(total_quantity, 50), COALESCE(available_quantity, 0) + 1),
-                         status = 'AVAILABLE'
-                     WHERE equipment_id = ?`,
-                    [equipment_id],
-                    (err, updateResult) => {
-                        if (err) {
-                            return res.status(500).json({ error: err.message });
-                        }
-
-                        res.json({
-                            message: "Equipment returned successfully"
-                        });
-                    }
-                );
-            }
-        );
+    return res.status(410).json({
+        message: "This quantity-based return endpoint is retired. Create a return QR for the exact active transaction."
     });
 });
 
@@ -1341,64 +1254,42 @@ app.get("/api/admin/student/:student_id", authenticateToken, requireAdmin, (req,
 const PORT = Number(process.env.PORT) || 3000;
 
 app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
-    const {
-        equipment_code,
-        name,
-        category,
-        rfid_tag,
-        calibration_limit
-    } = req.body;
-
-    if (
-        !equipment_code ||
-        !name ||
-        !category ||
-        !rfid_tag
-    ) {
-        return res.status(400).json({
-            message: "Please fill in all required fields."
-        });
+    const { equipment_code, name, category, rfid_tag, calibration_limit } = req.body || {};
+    const quantity = Number(req.body?.total_quantity ?? 1);
+    if (!equipment_code || !name || !category) {
+        return res.status(400).json({ message: "Equipment code, name and category are required. RFID tags can be linked to units later." });
     }
-
-    const qrToken = crypto.randomBytes(16).toString("hex");
-    const sql = `
-        INSERT INTO equipment
-        (equipment_code, name, category, rfid_tag, qr_token,
-         status, runtime_hours, calibration_limit, total_quantity, available_quantity)
-        VALUES (?, ?, ?, ?, ?, 'AVAILABLE', 0, ?, ?, ?)
-    `;
-
-    const quantity = Number.isSafeInteger(Number(req.body.total_quantity)) && Number(req.body.total_quantity) >= 1 && Number(req.body.total_quantity) <= 100000 ? Number(req.body.total_quantity) : 1;
-    const values = [
-        equipment_code,
-        name,
-        category,
-        rfid_tag,
-        qrToken,
-        calibration_limit || 500,
-        quantity,
-        quantity
-    ];
-
-    db.query(sql, values, (error, result) => {
-        if (error) {
-            console.error("Add equipment error:", error);
-
-            if (error.code === "ER_DUP_ENTRY") {
-                return res.status(409).json({
-                    message:
-                        "Equipment code or RFID tag already exists."
-                });
-            }
-
-            return res.status(500).json({
-                message: "Could not add equipment."
-            });
-        }
-
-        res.status(201).json({
-            message: "Equipment added successfully!",
-            equipment_id: result.insertId
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000) {
+        return res.status(400).json({ message: "Quantity must be a whole number between 1 and 1000." });
+    }
+    const baseCode = String(equipment_code).trim();
+    const baseRfid = String(rfid_tag || "").trim() || null;
+    const limit = Number(calibration_limit) > 0 ? Number(calibration_limit) : 500;
+    const values = Array.from({ length: quantity }, (_, index) => {
+        const suffix = String(index + 1).padStart(3, "0");
+        const code = quantity === 1 ? baseCode : baseCode + "-" + suffix;
+        const rfid = index === 0 ? baseRfid : null;
+        return [code, name, category, rfid, crypto.randomBytes(16).toString("hex"), limit];
+    });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not add equipment units." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start equipment creation." }); }
+            connection.query(
+                "INSERT INTO equipment (equipment_code,name,category,rfid_tag,qr_token,status,runtime_hours,calibration_limit,total_quantity,available_quantity) VALUES ?",
+                [values.map(row => [...row, "AVAILABLE", 0, row[5], 1, 1])],
+                (insertError, result) => {
+                    if (insertError) return connection.rollback(() => {
+                        connection.release();
+                        res.status(insertError.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: insertError.code === "ER_DUP_ENTRY" ? "Equipment code or RFID tag already exists. Choose a new base code or RFID." : "Could not add equipment units." });
+                    });
+                    connection.commit(commitError => {
+                        connection.release();
+                        if (commitError) return res.status(500).json({ message: "Equipment units could not be saved." });
+                        res.status(201).json({ message: quantity + " individual equipment unit(s) added successfully.", first_equipment_id: result.insertId, units_created: quantity });
+                    });
+                }
+            );
         });
     });
 });
