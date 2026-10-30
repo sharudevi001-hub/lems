@@ -181,49 +181,37 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         });
     }
 
-    const sql = `
-        UPDATE equipment
-        SET equipment_code = ?,
-            name = ?,
-            category = ?,
-            rfid_tag = ?,
-            status = ?,
-            calibration_limit = ?,
-            available_quantity = GREATEST(0, ? - (COALESCE(total_quantity, 1) - COALESCE(available_quantity, 1))),
-            total_quantity = ?
-        WHERE equipment_id = ?
-    `;
-
-    const values = [
-        equipment_code,
-        name,
-        category,
-        rfid_tag,
-        status,
-        calibration_limit || 500,
-        Number.isSafeInteger(Number(total_quantity)) && Number(total_quantity) >= 1 ? Number(total_quantity) : 1,
-        Number.isSafeInteger(Number(total_quantity)) && Number(total_quantity) >= 1 ? Number(total_quantity) : 1,
-        id
-    ];
-
-    db.query(sql, values, (error, result) => {
-        if (error) {
-            console.error("Update equipment error:", error);
-            return res.status(500).json({
-                message: "Could not update equipment."
-            });
-        }
-
-        if (result.affectedRows === 0) {
-            return res.status(404).json({
-                message: "Equipment not found."
-            });
-        }
-
-        res.json({
-            message: "Equipment updated successfully!"
+    const updateUnit = () => {
+        const sql = `
+            UPDATE equipment
+            SET equipment_code = ?, name = ?, category = ?, rfid_tag = ?,
+                status = ?, calibration_limit = ?,
+                total_quantity = 1,
+                available_quantity = CASE WHEN ? = 'AVAILABLE' THEN 1 ELSE 0 END
+            WHERE equipment_id = ?
+        `;
+        db.query(sql, [equipment_code, name, category, rfid_tag, status, calibration_limit || 500, status, id], (error, result) => {
+            if (error) {
+                console.error("Update equipment error:", error);
+                return res.status(error.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: error.code === "ER_DUP_ENTRY" ? "Equipment code or RFID tag already exists." : "Could not update equipment." });
+            }
+            if (!result.affectedRows) return res.status(404).json({ message: "Equipment not found." });
+            return res.json({ message: "Individual equipment unit updated successfully." });
         });
-    });
+    };
+
+    if (status !== "AVAILABLE") return updateUnit();
+    db.query(
+        "SELECT (SELECT COUNT(*) FROM transactions WHERE equipment_id = ? AND status = 'ACTIVE') AS active_count, (SELECT COUNT(*) FROM complaints WHERE equipment_id = ? AND status NOT IN ('RESOLVED','REJECTED')) AS open_count",
+        [id, id],
+        (checkError, rows) => {
+            if (checkError) return res.status(500).json({ message: "Could not verify unit availability." });
+            if (Number(rows[0]?.active_count || 0) > 0 || Number(rows[0]?.open_count || 0) > 0) {
+                return res.status(409).json({ message: "This unit has an active loan or unresolved maintenance report. It cannot be marked available." });
+            }
+            updateUnit();
+        }
+    );
 });
 
 // Public self-registration is disabled. Student accounts are created by administrators only.
