@@ -103,19 +103,8 @@ async function main() {
       } else console.log("equipment." + column + " already exists");
     }
 
-    // RFID is optional for physical units until an RFID sticker is assigned.
-    // Preserve the existing column type/length and unique index while allowing NULL.
-    const [rfidColumns] = await connection.execute(
-      "SELECT COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'equipment' AND COLUMN_NAME = 'rfid_tag' LIMIT 1",
-      [config.database]
-    );
-    if (!rfidColumns.length) throw new Error("Required column equipment.rfid_tag is missing.");
-    if (rfidColumns[0].IS_NULLABLE !== "YES") {
-      const safeType = String(rfidColumns[0].COLUMN_TYPE || "").toUpperCase();
-      if (!/^(VARCHAR|CHAR)\(\d+\)$/.test(safeType)) throw new Error("Unsupported equipment.rfid_tag type; manual review is required before making RFID optional.");
-      await connection.query("ALTER TABLE equipment MODIFY COLUMN rfid_tag " + safeType + " NULL");
-      console.log("Made equipment.rfid_tag optional; RFID can be linked after unit creation.");
-    } else console.log("equipment.rfid_tag already allows NULL");
+    // Legacy card columns, if present, are left untouched for historical compatibility.
+    // The application no longer reads or writes card identifiers.
 
     if (await columnExists(connection, "equipment", "qr_token")) {
       await connection.query("UPDATE equipment SET qr_token = REPLACE(UUID(), '-', '') WHERE qr_token IS NULL OR qr_token = ''");
