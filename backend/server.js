@@ -595,25 +595,70 @@ app.get("/api/complaints", authenticateToken, requireAdmin, (req, res) => {
     });
 });
 
-// Resolve Complaint API (Admin Side)
+// Resolve one maintenance complaint without releasing other units or active loans.
 app.put("/api/complaints/:id/resolve", authenticateToken, requireAdmin, (req, res) => {
-    const complaintId = req.params.id;
-    const { equipment_id, make_available } = req.body;
+    const complaintId = Number(req.params.id);
+    const makeAvailable = req.body?.make_available !== false;
+    if (!Number.isSafeInteger(complaintId) || complaintId < 1) {
+        return res.status(400).json({ message: "Invalid complaint ID." });
+    }
 
-    const updateSql = "UPDATE complaints SET status = 'RESOLVED' WHERE complaint_id = ?";
-    db.query(updateSql, [complaintId], (err, result) => {
-        if (err) {
-            console.error("Resolve complaint error:", err.message);
-            return res.status(500).json({ error: err.message });
-        }
-
-        if (make_available !== false && equipment_id) {
-            db.query("UPDATE equipment SET status = 'AVAILABLE' WHERE equipment_id = ?", [equipment_id], (err) => {
-                if (err) console.error("Error restoring equipment status to AVAILABLE:", err.message);
-            });
-        }
-
-        res.json({ message: "Complaint resolved and equipment status updated!" });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not resolve maintenance request." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start maintenance resolution." }); }
+            connection.query(
+                "SELECT complaint_id, equipment_id, status FROM complaints WHERE complaint_id = ? FOR UPDATE",
+                [complaintId],
+                (lookupError, complaints) => {
+                    if (lookupError || !complaints.length) {
+                        return connection.rollback(() => { connection.release(); res.status(lookupError ? 500 : 404).json({ message: lookupError ? "Could not load complaint." : "Maintenance complaint not found." }); });
+                    }
+                    const complaint = complaints[0];
+                    connection.query(
+                        "UPDATE complaints SET status = 'RESOLVED' WHERE complaint_id = ?",
+                        [complaintId],
+                        updateError => {
+                            if (updateError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not resolve complaint." }); });
+                            const finish = () => connection.commit(commitError => {
+                                connection.release();
+                                if (commitError) return res.status(500).json({ message: "Could not save maintenance resolution." });
+                                res.json({ message: makeAvailable ? "Complaint resolved. Equipment availability was checked safely." : "Complaint resolved; equipment remains unavailable." });
+                            });
+                            if (!makeAvailable || !complaint.equipment_id) return finish();
+                            connection.query(
+                                "SELECT COUNT(*) AS active_count FROM transactions WHERE equipment_id = ? AND status = 'ACTIVE'",
+                                [complaint.equipment_id],
+                                (activeError, activeRows) => {
+                                    if (activeError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not verify active loans." }); });
+                                    connection.query(
+                                        "SELECT COUNT(*) AS open_count FROM complaints WHERE equipment_id = ? AND status NOT IN ('RESOLVED','REJECTED')",
+                                        [complaint.equipment_id],
+                                        (openError, openRows) => {
+                                            if (openError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not verify other maintenance reports." }); });
+                                            const activeCount = Number(activeRows[0]?.active_count || 0);
+                                            const openCount = Number(openRows[0]?.open_count || 0);
+                                            if (activeCount === 0 && openCount === 0) {
+                                                connection.query(
+                                                    "UPDATE equipment SET status = 'AVAILABLE', available_quantity = GREATEST(COALESCE(available_quantity, 0), 1) WHERE equipment_id = ? AND status = 'MAINTENANCE'",
+                                                    [complaint.equipment_id],
+                                                    releaseError => {
+                                                        if (releaseError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not restore equipment availability." }); });
+                                                        finish();
+                                                    }
+                                                );
+                                            } else {
+                                                finish();
+                                            }
+                                        }
+                                    );
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+        });
     });
 });
 
