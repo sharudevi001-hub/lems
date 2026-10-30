@@ -1,0 +1,50 @@
+name: LEMS validation
+
+on:
+  pull_request:
+    branches:
+      - lems/full-spec-staged-implementation
+      - fix/individual-equipment-maintenance
+  push:
+    branches:
+      - fix/individual-equipment-maintenance
+      - remove/rfid-use-qr-only
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend-react/package-lock.json
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+      - name: Check backend JavaScript syntax
+        working-directory: backend
+        run: node --check server.js
+      - name: Check checkout migration syntax
+        working-directory: backend
+        run: node --check scripts/migrate-checkout-schema.js
+      - name: Check schema checker syntax
+        working-directory: backend
+        run: node --check scripts/check-schema.js
+      - name: Check read-only reconciliation report syntax
+        working-directory: backend
+        run: node --check scripts/inspect-inventory-reconciliation.js
+      - name: Install frontend dependencies
+        working-directory: frontend-react
+        run: npm ci
+      - name: Build frontend
+        working-directory: frontend-react
+        run: npm run build
