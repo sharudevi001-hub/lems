@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - lems/full-spec-staged-implementation
+      - fix/individual-equipment-maintenance
+      - remove/rfid-use-qr-only
   push:
     branches:
       - fix/individual-equipment-maintenance
@@ -30,7 +32,7 @@ jobs:
         run: npm ci
       - name: Check backend JavaScript syntax
         working-directory: backend
-        run: node --check server.js && node --check scripts/migrate-checkout-schema.js
+        run: node --check server.js && node --check scripts/migrate-checkout-schema.js && node --check scripts/check-schema.js
       - name: Install frontend dependencies
         working-directory: frontend-react
         run: npm ci
