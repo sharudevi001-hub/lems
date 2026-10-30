@@ -68,21 +68,44 @@ async function main() {
         }
         // An aggregate row cannot identify which historic loan maps to which unit.
         // Keep the original row for its active loan when one exists; clones are free units.
-        const [openRequests] = await connection.execute(
-          "SELECT COUNT(*) AS item_count FROM checkout_request_items WHERE equipment_id = ? AND COALESCE(quantity,1) > 1",
+        const [requestItems] = await connection.execute(
+          "SELECT request_item_id, request_id, COALESCE(quantity,1) AS quantity FROM checkout_request_items WHERE equipment_id = ? ORDER BY request_item_id",
           [row.equipment_id]
         );
-        if (openRequests[0] && Number(openRequests[0].item_count) > 0) {
-          throw new Error("Cannot safely split equipment_id=" + row.equipment_id + ": a checkout request item has quantity > 1.");
+        const requestedUnits = requestItems.reduce((sum, item) => sum + Number(item.quantity || 1), 0);
+        if (requestedUnits > total) {
+          throw new Error("Cannot safely split equipment_id=" + row.equipment_id + ": checkout requests ask for " + requestedUnits + " units but stock has only " + total + ".");
         }
+        const newUnitIds = [];
         for (let unit = 1; unit < total; unit++) {
           const code = String(row.equipment_code || ("LEMS-" + row.equipment_id)) + "-U" + String(unit + 1).padStart(3, "0");
           const qr = require("crypto").randomBytes(16).toString("hex");
-          await connection.execute(
+          const [insertResult] = await connection.execute(
             "INSERT INTO equipment (equipment_code,name,category,rfid_tag,status,runtime_hours,calibration_limit,total_quantity,available_quantity,qr_token) " +
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             [code, row.name, row.category, "LEGACY-" + row.equipment_id + "-" + unit, "AVAILABLE", row.runtime_hours || 0, row.calibration_limit || 500, 1, 1, qr]
           );
+          newUnitIds.push(insertResult.insertId);
+        }
+        // Preserve every requested unit while converting aggregate request quantities
+        // into one request-item row per physical equipment ID.
+        let nextUnitIndex = 0;
+        for (const item of requestItems) {
+          const quantity = Number(item.quantity || 1);
+          if (quantity > 1) {
+            await connection.execute(
+              "UPDATE checkout_request_items SET quantity = 1 WHERE request_item_id = ?",
+              [item.request_item_id]
+            );
+            for (let copy = 1; copy < quantity; copy++) {
+              const unitId = newUnitIds[nextUnitIndex++];
+              if (!unitId) throw new Error("Not enough split units to expand checkout request " + item.request_id + ".");
+              await connection.execute(
+                "INSERT INTO checkout_request_items (request_id,equipment_id,quantity) VALUES (?,?,1)",
+                [item.request_id, unitId]
+              );
+            }
+          }
         }
         const hasActiveLoan = activeLoans.length > 0;
         await connection.execute(
