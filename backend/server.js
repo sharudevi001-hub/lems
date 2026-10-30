@@ -137,6 +137,19 @@ app.get("/api/equipment/qr/:token", authenticateToken, (req, res) => {
     });
 });
 
+// Complaint selection is separate from checkout inventory: students must be
+// able to report a fault against any exact physical unit, including unavailable
+// or currently borrowed units. Only the unit's unique code and name are exposed.
+app.get("/api/equipment/complaint-options", authenticateToken, (req, res) => {
+    db.query(
+        "SELECT equipment_id, equipment_code, name, category, status FROM equipment ORDER BY name, equipment_code",
+        (err, rows) => {
+            if (err) return res.status(500).json({ message: "Could not load equipment complaint options." });
+            res.json(rows);
+        }
+    );
+});
+
 // Administrators can review every unit. Students only receive equipment
 // records that are currently eligible for checkout.
 app.get("/api/equipment", authenticateToken, (req, res) => {
@@ -514,31 +527,64 @@ app.post("/api/reset-password", loginLimiter, (req, res) => {
 
 // Submit Complaint / Maintenance Request API (Student Side)
 app.post("/api/complaints", authenticateToken, (req, res) => {
-    const { equipment_id, issue_description } = req.body || {};
-    const user_id = req.user.user_id;
+    const equipmentId = Number(req.body?.equipment_id);
+    const issueDescription = String(req.body?.issue_description || "").trim();
+    const userId = req.user.user_id;
 
-    if (!user_id || !equipment_id || !issue_description) {
-        return res.status(400).json({ message: "User ID, Equipment ID, and Issue Description are required." });
+    if (!Number.isSafeInteger(equipmentId) || equipmentId < 1 || !issueDescription || issueDescription.length > 2000) {
+        return res.status(400).json({ message: "Select one equipment unit and describe the issue (up to 2000 characters)." });
     }
 
-    const insertSql = `
-        INSERT INTO complaints (user_id, equipment_id, issue_description, status)
-        VALUES (?, ?, ?, 'PENDING')
-    `;
-
-    db.query(insertSql, [user_id, equipment_id, issue_description.trim()], (err, result) => {
-        if (err) {
-            console.error("Submit complaint error:", err.message);
-            return res.status(500).json({ error: err.message });
-        }
-
-        // Update equipment status to MAINTENANCE
-        db.query("UPDATE equipment SET status = 'MAINTENANCE' WHERE equipment_id = ?", [equipment_id], (err) => {
-            if (err) console.error("Error updating equipment status to MAINTENANCE:", err.message);
-        });
-
-        res.status(201).json({
-            message: "Maintenance complaint submitted successfully! Equipment marked for review."
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not submit the maintenance complaint." });
+        connection.beginTransaction(beginError => {
+            if (beginError) {
+                connection.release();
+                return res.status(500).json({ message: "Could not start the complaint transaction." });
+            }
+            connection.query(
+                "SELECT equipment_id, equipment_code FROM equipment WHERE equipment_id = ? FOR UPDATE",
+                [equipmentId],
+                (lookupError, units) => {
+                    if (lookupError || !units.length) {
+                        return connection.rollback(() => {
+                            connection.release();
+                            res.status(lookupError ? 500 : 404).json({ message: lookupError ? "Could not verify the equipment unit." : "Equipment unit not found." });
+                        });
+                    }
+                    connection.query(
+                        "INSERT INTO complaints (user_id, equipment_id, issue_description, status) VALUES (?, ?, ?, 'PENDING')",
+                        [userId, equipmentId, issueDescription],
+                        insertError => {
+                            if (insertError) {
+                                return connection.rollback(() => {
+                                    connection.release();
+                                    res.status(500).json({ message: "Could not save the maintenance complaint." });
+                                });
+                            }
+                            connection.query(
+                                "UPDATE equipment SET status = 'MAINTENANCE', available_quantity = 0 WHERE equipment_id = ?",
+                                [equipmentId],
+                                updateError => {
+                                    if (updateError) {
+                                        return connection.rollback(() => {
+                                            connection.release();
+                                            res.status(500).json({ message: "Could not mark the reported unit for maintenance." });
+                                        });
+                                    }
+                                    connection.commit(commitError => {
+                                        connection.release();
+                                        if (commitError) return res.status(500).json({ message: "Could not complete the complaint submission." });
+                                        res.status(201).json({
+                                            message: "Complaint submitted for " + units[0].equipment_code + ". Only this equipment unit was marked for maintenance."
+                                        });
+                                    });
+                                }
+                            );
+                        }
+                    );
+                }
+            );
         });
     });
 });
