@@ -128,17 +128,24 @@ app.get("/api/equipment/qr/:token", authenticateToken, (req, res) => {
     db.query("SELECT equipment_id, equipment_code, name, category, status, COALESCE(available_quantity,1) AS available_quantity, COALESCE(total_quantity,1) AS total_quantity FROM equipment WHERE qr_token = ? LIMIT 1", [token], (err, rows) => {
         if (err) return res.status(500).json({ message: "Could not resolve equipment QR. Apply the reviewed equipment QR migration first." });
         if (!rows.length) return res.status(404).json({ message: "Equipment QR was not found." });
-        res.json({ equipment: rows[0] });
+        const equipment = rows[0];
+        if (String(req.user.role || "").toLowerCase() !== "admin" &&
+            (String(equipment.status || "").toUpperCase() !== "AVAILABLE" || Number(equipment.available_quantity) < 1)) {
+            return res.status(409).json({ message: "This equipment unit is not available for checkout." });
+        }
+        res.json({ equipment });
     });
 });
 
-// Get all equipment
+// Administrators can review every unit. Students only receive equipment
+// records that are currently eligible for checkout.
 app.get("/api/equipment", authenticateToken, (req, res) => {
-    db.query("SELECT * FROM equipment", (err, results) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-
+    const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
+    const sql = isAdmin
+        ? "SELECT * FROM equipment ORDER BY name, equipment_code"
+        : "SELECT * FROM equipment WHERE status = 'AVAILABLE' AND COALESCE(available_quantity, 1) > 0 ORDER BY name, equipment_code";
+    db.query(sql, (err, results) => {
+        if (err) return res.status(500).json({ error: err.message });
         res.json(results);
     });
 });
