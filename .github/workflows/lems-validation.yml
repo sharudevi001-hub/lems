@@ -39,6 +39,9 @@ jobs:
       - name: Check schema checker syntax
         working-directory: backend
         run: node --check scripts/check-schema.js
+      - name: Check read-only reconciliation report syntax
+        working-directory: backend
+        run: node --check scripts/inspect-inventory-reconciliation.js
       - name: Install frontend dependencies
         working-directory: frontend-react
         run: npm ci
