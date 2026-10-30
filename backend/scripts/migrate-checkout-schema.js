@@ -41,6 +41,58 @@ async function main() {
       if (!tableNames.has(requiredTable)) throw new Error("Required table is missing: " + requiredTable + ". Apply the base LEMS migrations first.");
     }
 
+    // Reconcile legacy quantity-based stock into one row per physical unit.
+    // Keep each original equipment_id so existing transactions, checkout requests,
+    // and condition reports remain attached to a real unit. Additional units get
+    // fresh codes and QR tokens. This is idempotent: rows are split only while
+    // total_quantity > 1, and each successful split sets the original to quantity 1.
+    const hasTotalQuantityForSplit = await columnExists(connection, "equipment", "total_quantity");
+    const hasAvailableQuantityForSplit = await columnExists(connection, "equipment", "available_quantity");
+    if (hasTotalQuantityForSplit && hasAvailableQuantityForSplit) {
+      const [legacyRows] = await connection.query(
+        "SELECT equipment_id, equipment_code, name, category, rfid_tag, status, runtime_hours, calibration_limit, total_quantity, available_quantity, qr_token " +
+        "FROM equipment WHERE COALESCE(total_quantity,1) > 1 ORDER BY equipment_id"
+      );
+      for (const row of legacyRows) {
+        const total = Number(row.total_quantity || 1);
+        const available = Number(row.available_quantity || 0);
+        if (!Number.isInteger(total) || total < 1 || available < 0 || available > total) {
+          throw new Error("Invalid stock quantities for equipment_id=" + row.equipment_id + "; refusing to split.");
+        }
+        const [activeLoans] = await connection.execute(
+          "SELECT transaction_id FROM transactions WHERE equipment_id = ? AND status = 'ACTIVE' ORDER BY transaction_id",
+          [row.equipment_id]
+        );
+        if (activeLoans.length > 1 || activeLoans.length > (total - available)) {
+          throw new Error("Cannot safely split equipment_id=" + row.equipment_id + ": active loan count does not match checked-out quantity.");
+        }
+        // An aggregate row cannot identify which historic loan maps to which unit.
+        // Keep the original row for its active loan when one exists; clones are free units.
+        const [openRequests] = await connection.execute(
+          "SELECT COUNT(*) AS item_count FROM checkout_request_items WHERE equipment_id = ? AND COALESCE(quantity,1) > 1",
+          [row.equipment_id]
+        );
+        if (openRequests[0] && Number(openRequests[0].item_count) > 0) {
+          throw new Error("Cannot safely split equipment_id=" + row.equipment_id + ": a checkout request item has quantity > 1.");
+        }
+        for (let unit = 1; unit < total; unit++) {
+          const code = String(row.equipment_code || ("LEMS-" + row.equipment_id)) + "-U" + String(unit + 1).padStart(3, "0");
+          const qr = require("crypto").randomBytes(16).toString("hex");
+          await connection.execute(
+            "INSERT INTO equipment (equipment_code,name,category,rfid_tag,status,runtime_hours,calibration_limit,total_quantity,available_quantity,qr_token) " +
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [code, row.name, row.category, null, "AVAILABLE", row.runtime_hours || 0, row.calibration_limit || 500, 1, 1, qr]
+          );
+        }
+        const hasActiveLoan = activeLoans.length > 0;
+        await connection.execute(
+          "UPDATE equipment SET total_quantity=1, available_quantity=?, status=? WHERE equipment_id=?",
+          [hasActiveLoan ? 0 : 1, hasActiveLoan ? "IN_USE" : (row.status === "MAINTENANCE" ? "MAINTENANCE" : "AVAILABLE"), row.equipment_id]
+        );
+        console.log("Split equipment " + row.equipment_code + " into " + total + " individual unit rows; original ID preserved.");
+      }
+    }
+
     // Safety preflight: never enable per-physical-unit checkout while a row still
     // represents multiple stock units, or while multiple active loans point at one row.
     // Run this before the first DDL statement because MySQL DDL auto-commits.
