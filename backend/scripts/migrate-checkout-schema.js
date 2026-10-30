@@ -81,7 +81,7 @@ async function main() {
           await connection.execute(
             "INSERT INTO equipment (equipment_code,name,category,rfid_tag,status,runtime_hours,calibration_limit,total_quantity,available_quantity,qr_token) " +
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            [code, row.name, row.category, null, "AVAILABLE", row.runtime_hours || 0, row.calibration_limit || 500, 1, 1, qr]
+            [code, row.name, row.category, "LEGACY-" + row.equipment_id + "-" + unit, "AVAILABLE", row.runtime_hours || 0, row.calibration_limit || 500, 1, 1, qr]
           );
         }
         const hasActiveLoan = activeLoans.length > 0;
