@@ -1393,64 +1393,42 @@ app.get("/api/admin/student/:student_id", authenticateToken, requireAdmin, (req,
 const PORT = Number(process.env.PORT) || 3000;
 
 app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
-    const {
-        equipment_code,
-        name,
-        category,
-        rfid_tag,
-        calibration_limit
-    } = req.body;
-
-    if (
-        !equipment_code ||
-        !name ||
-        !category ||
-        !rfid_tag
-    ) {
-        return res.status(400).json({
-            message: "Please fill in all required fields."
-        });
+    const { equipment_code, name, category, rfid_tag, calibration_limit } = req.body || {};
+    const quantity = Number(req.body?.total_quantity ?? 1);
+    if (!equipment_code || !name || !category || !rfid_tag) {
+        return res.status(400).json({ message: "Equipment code, name, category and the first RFID tag are required." });
     }
-
-    const qrToken = crypto.randomBytes(16).toString("hex");
-    const sql = `
-        INSERT INTO equipment
-        (equipment_code, name, category, rfid_tag, qr_token,
-         status, runtime_hours, calibration_limit, total_quantity, available_quantity)
-        VALUES (?, ?, ?, ?, ?, 'AVAILABLE', 0, ?, ?, ?)
-    `;
-
-    const quantity = Number.isSafeInteger(Number(req.body.total_quantity)) && Number(req.body.total_quantity) >= 1 && Number(req.body.total_quantity) <= 100000 ? Number(req.body.total_quantity) : 1;
-    const values = [
-        equipment_code,
-        name,
-        category,
-        rfid_tag,
-        qrToken,
-        calibration_limit || 500,
-        quantity,
-        quantity
-    ];
-
-    db.query(sql, values, (error, result) => {
-        if (error) {
-            console.error("Add equipment error:", error);
-
-            if (error.code === "ER_DUP_ENTRY") {
-                return res.status(409).json({
-                    message:
-                        "Equipment code or RFID tag already exists."
-                });
-            }
-
-            return res.status(500).json({
-                message: "Could not add equipment."
-            });
-        }
-
-        res.status(201).json({
-            message: "Equipment added successfully!",
-            equipment_id: result.insertId
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000) {
+        return res.status(400).json({ message: "Quantity must be a whole number between 1 and 1000." });
+    }
+    const baseCode = String(equipment_code).trim();
+    const baseRfid = String(rfid_tag).trim();
+    const limit = Number(calibration_limit) > 0 ? Number(calibration_limit) : 500;
+    const values = Array.from({ length: quantity }, (_, index) => {
+        const suffix = String(index + 1).padStart(3, "0");
+        const code = quantity === 1 ? baseCode : baseCode + "-" + suffix;
+        const rfid = index === 0 ? baseRfid : "PENDING-" + code;
+        return [code, name, category, rfid, crypto.randomBytes(16).toString("hex"), limit];
+    });
+    db.getConnection((connectionError, connection) => {
+        if (connectionError) return res.status(500).json({ message: "Could not add equipment units." });
+        connection.beginTransaction(beginError => {
+            if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start equipment creation." }); }
+            connection.query(
+                "INSERT INTO equipment (equipment_code,name,category,rfid_tag,qr_token,status,runtime_hours,calibration_limit,total_quantity,available_quantity) VALUES ?",
+                [values.map(row => [...row, "AVAILABLE", 0, row[5], 1, 1])],
+                (insertError, result) => {
+                    if (insertError) return connection.rollback(() => {
+                        connection.release();
+                        res.status(insertError.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: insertError.code === "ER_DUP_ENTRY" ? "Equipment code or RFID tag already exists. Choose a new base code or RFID." : "Could not add equipment units." });
+                    });
+                    connection.commit(commitError => {
+                        connection.release();
+                        if (commitError) return res.status(500).json({ message: "Equipment units could not be saved." });
+                        res.status(201).json({ message: quantity + " individual equipment unit(s) added successfully.", first_equipment_id: result.insertId, units_created: quantity });
+                    });
+                }
+            );
         });
     });
 });
