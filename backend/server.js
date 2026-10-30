@@ -31,7 +31,7 @@ app.use(cors({
         return callback(null, false);
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Kiosk-Key"]
+    allowedHeaders: ["Content-Type", "Authorization"]
 }));
 app.use(express.json({ limit: "1mb" }));
 
@@ -93,12 +93,6 @@ const requireAdmin = (req, res, next) => {
     }
     next();
 };
-const verifyKioskKey = (req, res, next) => {
-    const expected = process.env.KIOSK_API_KEY;
-    if (!expected) return res.status(503).json({ message: "Kiosk integration is not enabled." });
-    if ((req.get("x-kiosk-key") || "") !== expected) return res.status(401).json({ message: "Invalid kiosk credentials." });
-    next();
-};
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 20,
@@ -154,9 +148,11 @@ app.get("/api/equipment/complaint-options", authenticateToken, (req, res) => {
 // records that are currently eligible for checkout.
 app.get("/api/equipment", authenticateToken, (req, res) => {
     const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
+    // Explicitly select QR-era fields; never expose the retained legacy RFID column.
+    const equipmentFields = "equipment_id,equipment_code,name,category,qr_token,status,runtime_hours,calibration_limit,total_quantity,available_quantity";
     const sql = isAdmin
-        ? "SELECT * FROM equipment ORDER BY name, equipment_code"
-        : "SELECT * FROM equipment WHERE status = 'AVAILABLE' AND COALESCE(available_quantity, 1) > 0 ORDER BY name, equipment_code";
+        ? "SELECT " + equipmentFields + " FROM equipment ORDER BY name, equipment_code"
+        : "SELECT " + equipmentFields + " FROM equipment WHERE status = 'AVAILABLE' AND COALESCE(available_quantity, 1) > 0 ORDER BY name, equipment_code";
     db.query(sql, (err, results) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(results);
@@ -169,7 +165,6 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         equipment_code,
         name,
         category,
-        rfid_tag,
         status,
         calibration_limit,
         total_quantity
@@ -184,7 +179,7 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
 
     if (!equipment_code || !name || !category) {
         return res.status(400).json({
-            message: "Equipment code, name, and category are required. RFID can be linked later."
+            message: "Equipment code, name and category are required."
         });
     }
 
@@ -197,16 +192,16 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
     const updateUnit = () => {
         const sql = `
             UPDATE equipment
-            SET equipment_code = ?, name = ?, category = ?, rfid_tag = ?,
+            SET equipment_code = ?, name = ?, category = ?,
                 status = ?, calibration_limit = ?,
                 total_quantity = 1,
                 available_quantity = CASE WHEN ? = 'AVAILABLE' THEN 1 ELSE 0 END
             WHERE equipment_id = ?
         `;
-        db.query(sql, [equipment_code, name, category, String(rfid_tag || "").trim() || null, status, calibration_limit || 500, status, id], (error, result) => {
+        db.query(sql, [equipment_code, name, category, status, calibration_limit || 500, status, id], (error, result) => {
             if (error) {
                 console.error("Update equipment error:", error);
-                return res.status(error.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: error.code === "ER_DUP_ENTRY" ? "Equipment code or RFID tag already exists." : "Could not update equipment." });
+                return res.status(error.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: error.code === "ER_DUP_ENTRY" ? "Equipment code already exists." : "Could not update equipment." });
             }
             if (!result.affectedRows) return res.status(404).json({ message: "Equipment not found." });
             return res.json({ message: "Individual equipment unit updated successfully." });
@@ -259,8 +254,7 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
     });
 });
 
-// Admin-only student directory and RFID card linking.
-// Uses the existing users.rfid_uid column; no additional table or migration is required.
+// Admin-only student directory. Legacy card identifiers are not used by the application.
 app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
     const sql = "SELECT * FROM users WHERE LOWER(role) = 'student' ORDER BY name ASC";
 
@@ -269,24 +263,7 @@ app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
             console.error("Student directory query failed:", err.message);
             return res.status(500).json({ message: "Could not load students." });
         }
-        return res.json({ students: rows.map(({ password, reset_token, reset_token_expires, ...row }) => ({ ...row, account_status: row.account_status || "ACTIVE", rfid_status: row.rfid_uid ? "ACTIVE" : null })) });
-    });
-});
-
-app.post("/api/admin/students/:studentId/rfid-session", authenticateToken, requireAdmin, (req, res) => {
-    const studentId = Number(req.params.studentId);
-    if (!Number.isSafeInteger(studentId) || studentId < 1) return res.status(400).json({ message: "Invalid student account ID." });
-    db.query("SELECT user_id,COALESCE(account_status,'ACTIVE') AS account_status FROM users WHERE user_id=? AND LOWER(role)='student' LIMIT 1", [studentId], (err, rows) => {
-        if (err) return res.status(500).json({ message: "Could not verify student account. Apply the reviewed registration migration first." });
-        if (!rows.length) return res.status(404).json({ message: "Student account not found." });
-        if (String(rows[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(409).json({ message: "Activate this student account before linking an RFID card." });
-        db.query("UPDATE rfid_registration_sessions SET status='CANCELLED' WHERE status='PENDING' AND expires_at > NOW()", cancelError => {
-            if (cancelError) return res.status(500).json({ message: "RFID registration session table is not ready. Apply the reviewed migration." });
-            db.query("INSERT INTO rfid_registration_sessions (target_user_id,created_by,status,expires_at) VALUES (?,?, 'PENDING', DATE_ADD(NOW(), INTERVAL 3 MINUTE))", [studentId,req.user.user_id], (insertError, result) => {
-                if (insertError) return res.status(500).json({ message: "Could not start RFID registration." });
-                res.status(201).json({ message: "Registration mode is active. Tap the student's card on the ESP32 within 3 minutes.", registration_session_id: result.insertId, expires_in_seconds: 180 });
-            });
-        });
+        return res.json({ students: rows.map(({ password, reset_token, reset_token_expires, ...row }) => ({ ...row, account_status: row.account_status || "ACTIVE" })) });
     });
 });
 
@@ -299,54 +276,6 @@ app.put("/api/admin/students/:studentId/status", authenticateToken, requireAdmin
         if (!result.affectedRows) return res.status(404).json({ message: "Student account not found." });
         res.json({ message: "Student account status updated.", account_status: status });
     });
-});
-
-app.put("/api/admin/students/:studentId/rfid", authenticateToken, requireAdmin, (req, res) => {
-    const studentId = Number(req.params.studentId);
-    const rawUid = String((req.body || {}).rfid_uid || "");
-    const rfidUid = rawUid.replace(/[\s:-]/g, "").toUpperCase();
-
-    if (!Number.isSafeInteger(studentId) || studentId < 1) {
-        return res.status(400).json({ message: "Invalid student account ID." });
-    }
-    if (!/^[0-9A-F]{4,32}$/.test(rfidUid)) {
-        return res.status(400).json({ message: "Enter a valid RFID UID (4–32 hexadecimal characters)." });
-    }
-
-    db.query(
-        "SELECT user_id FROM users WHERE user_id = ? AND LOWER(role) = 'student' LIMIT 1",
-        [studentId],
-        (studentError, studentRows) => {
-            if (studentError) {
-                console.error("RFID student check failed:", studentError.message);
-                return res.status(500).json({ message: "Could not verify the student account." });
-            }
-            if (!studentRows.length) {
-                return res.status(404).json({ message: "Student account not found." });
-            }
-
-            db.query(
-                "UPDATE users SET rfid_uid = ? WHERE user_id = ?",
-                [rfidUid, studentId],
-                (linkError) => {
-                    if (linkError) {
-                        if (linkError.code === "ER_DUP_ENTRY") {
-                            return res.status(409).json({ message: "This RFID card is already linked to another student." });
-                        }
-                        console.error("RFID card link failed:", linkError.message);
-                        return res.status(500).json({ message: "Could not link the RFID card." });
-                    }
-
-                    return res.json({
-                        message: "RFID card linked successfully.",
-                        student_id: studentId,
-                        rfid_uid: rfidUid,
-                        status: "ACTIVE"
-                    });
-                }
-            );
-        }
-    );
 });
 
 app.post("/api/login", loginLimiter, (req, res) => {
@@ -1001,7 +930,10 @@ app.post("/api/admin/return-qr/confirm", authenticateToken, requireAdmin, (req, 
                     const tx = txs[0];
                     connection.query("UPDATE transactions SET status = 'RETURNED', return_time = NOW() WHERE transaction_id = ? AND status = 'ACTIVE'", [tx.transaction_id], (updateTxError, result) => {
                         if (updateTxError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return was not recorded." }); });
-                        connection.query("UPDATE equipment SET available_quantity = LEAST(COALESCE(total_quantity, 50), COALESCE(available_quantity, 0) + 1), status = 'AVAILABLE' WHERE equipment_id = ?", [tx.equipment_id], stockError => {
+                        connection.query(
+                            "UPDATE equipment SET status = CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id = equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) THEN 'MAINTENANCE' WHEN EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id = equipment.equipment_id AND t.status = 'ACTIVE' AND t.transaction_id <> ?) THEN 'IN_USE' ELSE 'AVAILABLE' END, available_quantity = CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id = equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) OR EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id = equipment.equipment_id AND t.status = 'ACTIVE' AND t.transaction_id <> ?) THEN 0 ELSE 1 END WHERE equipment_id = ?",
+                            [tx.transaction_id, tx.transaction_id, tx.equipment_id],
+                            stockError => {
                             if (stockError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not update available stock." }); });
                             connection.query("UPDATE return_qr_tokens SET status = 'USED', used_at = NOW(), used_by = ? WHERE return_token_id = ? AND status = 'PENDING'", [req.user.user_id, qr.return_token_id], (markError, markResult) => {
                                 if (markError || markResult.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return QR was already consumed." }); });
@@ -1022,139 +954,6 @@ app.post("/api/return", authenticateToken, (req, res) => {
     });
 });
 
-// RFID Kiosk Scan API (ESP32 Hardware Integration)
-// Kiosk RFID verification: card UID is an identifier only; active account status is checked in MySQL.
-app.post("/api/kiosk/verify-rfid", verifyKioskKey, (req, res) => {
-    const uid = String((req.body || {}).uid || "").replace(/[\\s:-]/g, "").toUpperCase();
-    if (!/^[0-9A-F]{4,32}$/.test(uid)) return res.status(400).json({ valid: false, message: "Invalid RFID UID format." });
-    // An admin-created registration session is time-limited and single-use.
-    db.query("SELECT registration_session_id,target_user_id FROM rfid_registration_sessions WHERE status='PENDING' AND expires_at>NOW() ORDER BY registration_session_id DESC LIMIT 1", [], (sessionError, sessions) => {
-        if (sessionError) {
-            // Keep normal RFID verification working on an existing database until the additive migration is applied.
-            return db.query("SELECT * FROM users WHERE rfid_uid=? LIMIT 1", [uid], (verifyError, rows) => {
-                if (verifyError) return res.status(500).json({ valid: false, message: "Student verification is unavailable." });
-                if (!rows.length || String(rows[0].role || "").toLowerCase() !== "student" || String(rows[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(200).json({ valid: false, message: "Invalid or inactive Student Card. Access denied." });
-                res.json({ valid: true, registration: false, message: "Student verified.", student: { user_id: rows[0].user_id, name: rows[0].name, student_id: rows[0].student_id } });
-            });
-        }
-        if (sessions.length) {
-            const session = sessions[0];
-            db.getConnection((connectionError, connection) => {
-                if (connectionError) return res.status(500).json({ valid: false, message: "RFID registration is temporarily unavailable." });
-                connection.beginTransaction(beginError => {
-                    if (beginError) { connection.release(); return res.status(500).json({ valid: false, message: "Could not start RFID registration." }); }
-                    connection.query("SELECT registration_session_id,target_user_id FROM rfid_registration_sessions WHERE registration_session_id=? AND status='PENDING' AND expires_at>NOW() FOR UPDATE", [session.registration_session_id], (lockError, active) => {
-                        if (lockError || !active.length) return connection.rollback(() => { connection.release(); res.status(409).json({ valid: false, message: "RFID registration session expired. Start again." }); });
-                        connection.query("UPDATE users SET rfid_uid=? WHERE user_id=? AND LOWER(role)='student' AND COALESCE(account_status,'ACTIVE')='ACTIVE'", [uid,active[0].target_user_id], (linkError, linked) => {
-                            if (linkError || linked.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(linkError?.code === "ER_DUP_ENTRY" ? 409 : 500).json({ valid: false, message: linkError?.code === "ER_DUP_ENTRY" ? "Card Already Registered" : "Could not link RFID card." }); });
-                            connection.query("UPDATE rfid_registration_sessions SET status='USED',used_at=NOW(),used_uid=? WHERE registration_session_id=? AND status='PENDING'", [uid,active[0].registration_session_id], (markError, marked) => {
-                                if (markError || marked.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ valid: false, message: "Registration session was already used." }); });
-                                connection.commit(commitError => { connection.release(); if (commitError) return res.status(500).json({ valid: false, message: "RFID registration could not be committed." }); res.json({ valid: true, registration: true, message: "Student Registered Successfully" }); });
-                            });
-                        });
-                    });
-                });
-            });
-            return;
-        }
-        db.query("SELECT * FROM users WHERE rfid_uid=? LIMIT 1", [uid], (err, rows) => {
-            if (err) return res.status(500).json({ valid: false, message: "Student verification is unavailable." });
-            if (!rows.length || String(rows[0].role || "").toLowerCase() !== "student" || String(rows[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(200).json({ valid: false, message: "Invalid or inactive Student Card. Access denied." });
-            res.json({ valid: true, registration: false, message: "Student verified.", student: { user_id: rows[0].user_id, name: rows[0].name, student_id: rows[0].student_id } });
-        });
-    });
-});
-
-// The physical condition buttons can only annotate a pending return selected in the authenticated web flow.
-app.post("/api/kiosk/return-condition", verifyKioskKey, (req, res) => {
-    const uid = String((req.body || {}).uid || "").replace(/[\\s:-]/g, "").toUpperCase();
-    const condition = String((req.body || {}).condition || "").toUpperCase();
-    if (!/^[0-9A-F]{4,32}$/.test(uid) || !["GOOD","DAMAGED","MISSING_PARTS"].includes(condition)) return res.status(400).json({ message: "Valid student UID and return condition are required." });
-    db.query("SELECT * FROM users WHERE rfid_uid=? AND LOWER(role)='student' LIMIT 1", [uid], (userError, users) => {
-        if (userError || !users.length || String(users[0].account_status || "ACTIVE").toUpperCase() !== "ACTIVE") return res.status(userError ? 500 : 403).json({ message: "Student card is not registered or is inactive." });
-        db.query("SELECT s.return_session_id FROM return_sessions s JOIN return_session_items i ON i.return_session_id=s.return_session_id WHERE s.user_id=? AND s.status='PENDING' AND i.condition_status IS NULL ORDER BY s.created_at ASC,i.return_session_item_id ASC LIMIT 1", [users[0].user_id], (sessionError, sessions) => {
-            if (sessionError || !sessions.length) return res.status(sessionError ? 500 : 409).json({ message: "No pending return item is waiting for condition feedback." });
-            db.query("UPDATE return_session_items SET condition_status=? WHERE return_session_id=? AND condition_status IS NULL ORDER BY return_session_item_id ASC LIMIT 1", [condition,sessions[0].return_session_id], updateError => {
-                if (updateError) return res.status(500).json({ message: "Could not save return condition." });
-                res.json({ message: "Return condition saved.", condition });
-            });
-        });
-    });
-});
-
-app.post("/api/kiosk/scan", verifyKioskKey, (req, res) => {
-    const { student_rfid, equipment_rfid } = req.body;
-
-    if (!student_rfid || !equipment_rfid) {
-        return res.status(400).json({ message: "Student RFID and Equipment RFID are required." });
-    }
-
-    db.query("SELECT user_id, name, student_id FROM users WHERE rfid_uid = ?", [student_rfid.trim()], (err, users) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (users.length === 0) {
-            return res.status(404).json({ message: "Student RFID card not registered." });
-        }
-
-        const user = users[0];
-
-        db.query("SELECT equipment_id, equipment_code, name, status, available_quantity FROM equipment WHERE rfid_tag = ?", [equipment_rfid.trim()], (err, equipmentList) => {
-            if (err) return res.status(500).json({ error: err.message });
-            if (equipmentList.length === 0) {
-                return res.status(404).json({ message: "Equipment RFID tag not found." });
-            }
-
-            const equipment = equipmentList[0];
-
-            db.query("SELECT transaction_id FROM transactions WHERE user_id = ? AND equipment_id = ? AND status = 'ACTIVE'", [user.user_id, equipment.equipment_id], (err, activeTxs) => {
-                if (err) return res.status(500).json({ error: err.message });
-
-                if (activeTxs.length > 0) {
-                    // PROCESS RETURN
-                    const transactionId = activeTxs[0].transaction_id;
-                    db.query("UPDATE transactions SET status = 'RETURNED', return_time = NOW() WHERE transaction_id = ?", [transactionId], (err) => {
-                        if (err) return res.status(500).json({ error: err.message });
-
-                        db.query("UPDATE equipment SET available_quantity = LEAST(COALESCE(total_quantity, 50), COALESCE(available_quantity, 0) + 1), status = 'AVAILABLE' WHERE equipment_id = ?", [equipment.equipment_id], (err) => {
-                            if (err) return res.status(500).json({ error: err.message });
-
-                            res.json({
-                                action: "RETURN",
-                                message: `Return successful for ${user.name} (${equipment.name})`
-                            });
-                        });
-                    });
-                } else {
-                    // PROCESS CHECKOUT
-                    if (equipment.status === "MAINTENANCE" || equipment.status === "LOST" || (equipment.available_quantity ?? 50) <= 0) {
-                        return res.status(400).json({ message: "Equipment is out of stock or under maintenance." });
-                    }
-
-                    db.query("INSERT INTO transactions (user_id, equipment_id, status) VALUES (?, ?, 'ACTIVE')", [user.user_id, equipment.equipment_id], (err, result) => {
-                        if (err) return res.status(500).json({ error: err.message });
-
-                        db.query(
-                            `UPDATE equipment
-                             SET available_quantity = GREATEST(0, COALESCE(available_quantity, 50) - 1),
-                                 status = CASE WHEN (COALESCE(available_quantity, 50) - 1) <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END
-                             WHERE equipment_id = ?`,
-                            [equipment.equipment_id],
-                            (err) => {
-                                if (err) return res.status(500).json({ error: err.message });
-
-                                res.json({
-                                    action: "CHECKOUT",
-                                    message: `Checkout successful for ${user.name} (${equipment.name})`
-                                });
-                            }
-                        );
-                    });
-                }
-            });
-        });
-    });
-});
-
-// Get active checkouts for a specific user
 app.get("/api/transactions/user/:user_id", authenticateToken, (req, res) => {
     const requestedUserId = String(req.params.user_id);
     const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
@@ -1254,34 +1053,32 @@ app.get("/api/admin/student/:student_id", authenticateToken, requireAdmin, (req,
 const PORT = Number(process.env.PORT) || 3000;
 
 app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
-    const { equipment_code, name, category, rfid_tag, calibration_limit } = req.body || {};
+    const { equipment_code, name, category, calibration_limit } = req.body || {};
     const quantity = Number(req.body?.total_quantity ?? 1);
     if (!equipment_code || !name || !category) {
-        return res.status(400).json({ message: "Equipment code, name and category are required. RFID tags can be linked to units later." });
+        return res.status(400).json({ message: "Equipment code, name and category are required." });
     }
     if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000) {
         return res.status(400).json({ message: "Quantity must be a whole number between 1 and 1000." });
     }
     const baseCode = String(equipment_code).trim();
-    const baseRfid = String(rfid_tag || "").trim() || null;
     const limit = Number(calibration_limit) > 0 ? Number(calibration_limit) : 500;
     const values = Array.from({ length: quantity }, (_, index) => {
         const suffix = String(index + 1).padStart(3, "0");
         const code = quantity === 1 ? baseCode : baseCode + "-" + suffix;
-        const rfid = index === 0 ? baseRfid : null;
-        return [code, name, category, rfid, crypto.randomBytes(16).toString("hex"), limit];
+        return [code, name, category, crypto.randomBytes(16).toString("hex"), limit];
     });
     db.getConnection((connectionError, connection) => {
         if (connectionError) return res.status(500).json({ message: "Could not add equipment units." });
         connection.beginTransaction(beginError => {
             if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start equipment creation." }); }
             connection.query(
-                "INSERT INTO equipment (equipment_code,name,category,rfid_tag,qr_token,status,runtime_hours,calibration_limit,total_quantity,available_quantity) VALUES ?",
-                [values.map(row => [...row, "AVAILABLE", 0, row[5], 1, 1])],
+                "INSERT INTO equipment (equipment_code,name,category,qr_token,status,runtime_hours,calibration_limit,total_quantity,available_quantity) VALUES ?",
+                [values.map(row => [row[0], row[1], row[2], row[3], "AVAILABLE", 0, row[4], 1, 1])],
                 (insertError, result) => {
                     if (insertError) return connection.rollback(() => {
                         connection.release();
-                        res.status(insertError.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: insertError.code === "ER_DUP_ENTRY" ? "Equipment code or RFID tag already exists. Choose a new base code or RFID." : "Could not add equipment units." });
+                        res.status(insertError.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: insertError.code === "ER_DUP_ENTRY" ? "Equipment code already exists. Choose a new base code." : "Could not add equipment units." });
                     });
                     connection.commit(commitError => {
                         connection.release();

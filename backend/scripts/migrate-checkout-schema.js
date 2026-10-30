@@ -103,19 +103,19 @@ async function main() {
       } else console.log("equipment." + column + " already exists");
     }
 
-    // RFID is optional for physical units until an RFID sticker is assigned.
-    // Preserve the existing column type/length and unique index while allowing NULL.
-    const [rfidColumns] = await connection.execute(
+    // Keep the legacy card column only for old-row compatibility. It must be nullable,
+    // otherwise QR-only inserts that intentionally omit it fail on older databases.
+    // No card identifier is generated, read, or written by the application.
+    const [legacyCardColumns] = await connection.execute(
       "SELECT COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'equipment' AND COLUMN_NAME = 'rfid_tag' LIMIT 1",
       [config.database]
     );
-    if (!rfidColumns.length) throw new Error("Required column equipment.rfid_tag is missing.");
-    if (rfidColumns[0].IS_NULLABLE !== "YES") {
-      const safeType = String(rfidColumns[0].COLUMN_TYPE || "").toUpperCase();
-      if (!/^(VARCHAR|CHAR)\(\d+\)$/.test(safeType)) throw new Error("Unsupported equipment.rfid_tag type; manual review is required before making RFID optional.");
-      await connection.query("ALTER TABLE equipment MODIFY COLUMN rfid_tag " + safeType + " NULL");
-      console.log("Made equipment.rfid_tag optional; RFID can be linked after unit creation.");
-    } else console.log("equipment.rfid_tag already allows NULL");
+    if (legacyCardColumns.length && legacyCardColumns[0].IS_NULLABLE === "NO") {
+      const legacyType = String(legacyCardColumns[0].COLUMN_TYPE || "").trim();
+      if (!/^[a-zA-Z0-9_(),' ]+$/.test(legacyType)) throw new Error("Unexpected legacy equipment.rfid_tag column type; refusing automatic schema change.");
+      await connection.query("ALTER TABLE equipment MODIFY COLUMN rfid_tag " + legacyType + " NULL");
+      console.log("Made legacy equipment.rfid_tag nullable; QR-only application does not use it.");
+    }
 
     if (await columnExists(connection, "equipment", "qr_token")) {
       await connection.query("UPDATE equipment SET qr_token = REPLACE(UUID(), '-', '') WHERE qr_token IS NULL OR qr_token = ''");
