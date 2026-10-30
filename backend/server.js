@@ -163,7 +163,6 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         equipment_code,
         name,
         category,
-        rfid_tag,
         status,
         calibration_limit,
         total_quantity
@@ -253,8 +252,7 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
     });
 });
 
-// Admin-only student directory and RFID card linking.
-// Uses the existing users.rfid_uid column; no additional table or migration is required.
+// Admin-only student directory. Legacy card identifiers are not used by the application.
 app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
     const sql = "SELECT * FROM users WHERE LOWER(role) = 'student' ORDER BY name ASC";
 
@@ -1059,12 +1057,10 @@ app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
         return res.status(400).json({ message: "Quantity must be a whole number between 1 and 1000." });
     }
     const baseCode = String(equipment_code).trim();
-    const baseRfid = String(rfid_tag || "").trim() || null;
     const limit = Number(calibration_limit) > 0 ? Number(calibration_limit) : 500;
     const values = Array.from({ length: quantity }, (_, index) => {
         const suffix = String(index + 1).padStart(3, "0");
         const code = quantity === 1 ? baseCode : baseCode + "-" + suffix;
-        const rfid = index === 0 ? baseRfid : null;
         return [code, name, category, crypto.randomBytes(16).toString("hex"), limit];
     });
     db.getConnection((connectionError, connection) => {
@@ -1073,7 +1069,7 @@ app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
             if (beginError) { connection.release(); return res.status(500).json({ message: "Could not start equipment creation." }); }
             connection.query(
                 "INSERT INTO equipment (equipment_code,name,category,qr_token,status,runtime_hours,calibration_limit,total_quantity,available_quantity) VALUES ?",
-                [values.map(row => [...row, "AVAILABLE", 0, row[5], 1, 1])],
+                [values.map(row => [row[0], row[1], row[2], row[3], "AVAILABLE", 0, row[4], 1, 1])],
                 (insertError, result) => {
                     if (insertError) return connection.rollback(() => {
                         connection.release();
