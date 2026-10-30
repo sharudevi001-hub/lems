@@ -148,9 +148,11 @@ app.get("/api/equipment/complaint-options", authenticateToken, (req, res) => {
 // records that are currently eligible for checkout.
 app.get("/api/equipment", authenticateToken, (req, res) => {
     const isAdmin = String(req.user.role || "").toLowerCase() === "admin";
+    // Explicitly select QR-era fields; never expose the retained legacy RFID column.
+    const equipmentFields = "equipment_id,equipment_code,name,category,qr_token,status,runtime_hours,calibration_limit,total_quantity,available_quantity";
     const sql = isAdmin
-        ? "SELECT * FROM equipment ORDER BY name, equipment_code"
-        : "SELECT * FROM equipment WHERE status = 'AVAILABLE' AND COALESCE(available_quantity, 1) > 0 ORDER BY name, equipment_code";
+        ? "SELECT " + equipmentFields + " FROM equipment ORDER BY name, equipment_code"
+        : "SELECT " + equipmentFields + " FROM equipment WHERE status = 'AVAILABLE' AND COALESCE(available_quantity, 1) > 0 ORDER BY name, equipment_code";
     db.query(sql, (err, results) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(results);
@@ -928,7 +930,10 @@ app.post("/api/admin/return-qr/confirm", authenticateToken, requireAdmin, (req, 
                     const tx = txs[0];
                     connection.query("UPDATE transactions SET status = 'RETURNED', return_time = NOW() WHERE transaction_id = ? AND status = 'ACTIVE'", [tx.transaction_id], (updateTxError, result) => {
                         if (updateTxError || result.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return was not recorded." }); });
-                        connection.query("UPDATE equipment SET available_quantity = LEAST(COALESCE(total_quantity, 50), COALESCE(available_quantity, 0) + 1), status = 'AVAILABLE' WHERE equipment_id = ?", [tx.equipment_id], stockError => {
+                        connection.query(
+                            "UPDATE equipment SET status = CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id = equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) THEN 'MAINTENANCE' WHEN EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id = equipment.equipment_id AND t.status = 'ACTIVE' AND t.transaction_id <> ?) THEN 'IN_USE' ELSE 'AVAILABLE' END, available_quantity = CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id = equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) OR EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id = equipment.equipment_id AND t.status = 'ACTIVE' AND t.transaction_id <> ?) THEN 0 ELSE 1 END WHERE equipment_id = ?",
+                            [tx.transaction_id, tx.transaction_id, tx.equipment_id],
+                            stockError => {
                             if (stockError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not update available stock." }); });
                             connection.query("UPDATE return_qr_tokens SET status = 'USED', used_at = NOW(), used_by = ? WHERE return_token_id = ? AND status = 'PENDING'", [req.user.user_id, qr.return_token_id], (markError, markResult) => {
                                 if (markError || markResult.affectedRows !== 1) return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Return QR was already consumed." }); });
