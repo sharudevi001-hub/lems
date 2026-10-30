@@ -182,9 +182,9 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         "LOST"
     ];
 
-    if (!equipment_code || !name || !category || !rfid_tag) {
+    if (!equipment_code || !name || !category) {
         return res.status(400).json({
-            message: "Please fill in all required fields."
+            message: "Equipment code, name, and category are required. RFID can be linked later."
         });
     }
 
@@ -203,7 +203,7 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
                 available_quantity = CASE WHEN ? = 'AVAILABLE' THEN 1 ELSE 0 END
             WHERE equipment_id = ?
         `;
-        db.query(sql, [equipment_code, name, category, rfid_tag, status, calibration_limit || 500, status, id], (error, result) => {
+        db.query(sql, [equipment_code, name, category, String(rfid_tag || "").trim() || null, status, calibration_limit || 500, status, id], (error, result) => {
             if (error) {
                 console.error("Update equipment error:", error);
                 return res.status(error.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: error.code === "ER_DUP_ENTRY" ? "Equipment code or RFID tag already exists." : "Could not update equipment." });
@@ -1429,19 +1429,19 @@ const PORT = Number(process.env.PORT) || 3000;
 app.post("/api/equipment", authenticateToken, requireAdmin, (req, res) => {
     const { equipment_code, name, category, rfid_tag, calibration_limit } = req.body || {};
     const quantity = Number(req.body?.total_quantity ?? 1);
-    if (!equipment_code || !name || !category || !rfid_tag) {
-        return res.status(400).json({ message: "Equipment code, name, category and the first RFID tag are required." });
+    if (!equipment_code || !name || !category) {
+        return res.status(400).json({ message: "Equipment code, name and category are required. RFID tags can be linked to units later." });
     }
     if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000) {
         return res.status(400).json({ message: "Quantity must be a whole number between 1 and 1000." });
     }
     const baseCode = String(equipment_code).trim();
-    const baseRfid = String(rfid_tag).trim();
+    const baseRfid = String(rfid_tag || "").trim() || null;
     const limit = Number(calibration_limit) > 0 ? Number(calibration_limit) : 500;
     const values = Array.from({ length: quantity }, (_, index) => {
         const suffix = String(index + 1).padStart(3, "0");
         const code = quantity === 1 ? baseCode : baseCode + "-" + suffix;
-        const rfid = index === 0 ? baseRfid : "PENDING-" + code;
+        const rfid = index === 0 ? baseRfid : null;
         return [code, name, category, rfid, crypto.randomBytes(16).toString("hex"), limit];
     });
     db.getConnection((connectionError, connection) => {
