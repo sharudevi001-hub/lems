@@ -164,7 +164,6 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
         equipment_code,
         name,
         category,
-        rfid_tag,
         status,
         calibration_limit,
         total_quantity
@@ -179,7 +178,7 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
 
     if (!equipment_code || !name || !category) {
         return res.status(400).json({
-            message: "Equipment code, name, and category are required. RFID can be linked later."
+            message: "Equipment code, name and category are required."
         });
     }
 
@@ -192,16 +191,16 @@ app.put("/api/equipment/:id", authenticateToken, requireAdmin, (req, res) => {
     const updateUnit = () => {
         const sql = `
             UPDATE equipment
-            SET equipment_code = ?, name = ?, category = ?, rfid_tag = ?,
+            SET equipment_code = ?, name = ?, category = ?,
                 status = ?, calibration_limit = ?,
                 total_quantity = 1,
                 available_quantity = CASE WHEN ? = 'AVAILABLE' THEN 1 ELSE 0 END
             WHERE equipment_id = ?
         `;
-        db.query(sql, [equipment_code, name, category, String(rfid_tag || "").trim() || null, status, calibration_limit || 500, status, id], (error, result) => {
+        db.query(sql, [equipment_code, name, category, status, calibration_limit || 500, status, id], (error, result) => {
             if (error) {
                 console.error("Update equipment error:", error);
-                return res.status(error.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: error.code === "ER_DUP_ENTRY" ? "Equipment code or RFID tag already exists." : "Could not update equipment." });
+                return res.status(error.code === "ER_DUP_ENTRY" ? 409 : 500).json({ message: error.code === "ER_DUP_ENTRY" ? "Equipment code already exists." : "Could not update equipment." });
             }
             if (!result.affectedRows) return res.status(404).json({ message: "Equipment not found." });
             return res.json({ message: "Individual equipment unit updated successfully." });
@@ -255,7 +254,7 @@ app.post("/api/admin/students", authenticateToken, requireAdmin, loginLimiter, (
 });
 
 // Admin-only student directory.
-// Uses the existing users.rfid_uid column; no additional table or migration is required.
+// Student directory response omits card identifiers.
 app.get("/api/admin/students", authenticateToken, requireAdmin, (req, res) => {
     const sql = "SELECT * FROM users WHERE LOWER(role) = 'student' ORDER BY name ASC";
 
