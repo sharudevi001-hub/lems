@@ -715,9 +715,9 @@ app.post("/api/checkout-requests", authenticateToken, (req, res) => {
     }));
     const ids = items.map(item => item.equipment_id);
     if (ids.some(id => !Number.isSafeInteger(id) || id <= 0) ||
-        items.some(item => !Number.isSafeInteger(item.quantity) || item.quantity < 1 || item.quantity > 500) ||
+        items.some(item => item.quantity !== 1) ||
         new Set(ids).size !== ids.length) {
-        return res.status(400).json({ message: "Each equipment type must appear once with a whole-number quantity between 1 and 500." });
+        return res.status(400).json({ message: "Each selected physical unit must have quantity 1. Select separate equipment codes for separate units." });
     }
     const token = crypto.randomBytes(32).toString("hex");
     const tokenHash = hashQrToken(token);
@@ -847,114 +847,11 @@ app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, 
     });
 });
 
-// Checkout equipment API
+// Legacy quantity-based checkout is disabled. Use the individual-unit QR workflow.
 app.post("/api/checkout", authenticateToken, (req, res) => {
-    if (String(req.user.role || "").toLowerCase() !== "admin") {
-        return res.status(403).json({ message: "Student checkout must use the QR checkout request and admin issue workflow." });
-    }
-
-    const { equipment_id } = req.body || {};
-    const user_id = req.user.user_id;
-
-    if (!user_id || !equipment_id) {
-        return res.status(400).json({
-            message: "User ID and equipment ID are required"
-        });
-    }
-
-    // Check student exists
-    db.query(
-        "SELECT user_id FROM users WHERE user_id = ?",
-        [user_id],
-        (err, users) => {
-            if (err) {
-                return res.status(500).json({ error: err.message });
-            }
-
-            if (users.length === 0) {
-                return res.status(404).json({
-                    message: "Student not found. Please log in again."
-                });
-            }
-
-            // Check if user already has an active checkout for this equipment
-            db.query(
-                "SELECT transaction_id FROM transactions WHERE user_id = ? AND equipment_id = ? AND status = 'ACTIVE'",
-                [user_id, equipment_id],
-                (err, activeTxs) => {
-                    if (err) {
-                        return res.status(500).json({ error: err.message });
-                    }
-
-                    if (activeTxs.length > 0) {
-                        return res.status(400).json({
-                            message: "You already have an active checkout for this equipment. You must return it first."
-                        });
-                    }
-
-                    // Check equipment availability and quantity
-                    db.query(
-                        "SELECT status, COALESCE(available_quantity, 50) AS available_quantity, COALESCE(total_quantity, 50) AS total_quantity FROM equipment WHERE equipment_id = ?",
-                        [equipment_id],
-                        (err, equipment) => {
-                            if (err) {
-                                return res.status(500).json({ error: err.message });
-                            }
-
-                            if (equipment.length === 0) {
-                                return res.status(404).json({
-                                    message: "Equipment not found"
-                                });
-                            }
-
-                            const eq = equipment[0];
-                            if (eq.status === "MAINTENANCE" || eq.status === "LOST" || eq.available_quantity <= 0) {
-                                return res.status(400).json({
-                                    message: "Equipment is out of stock or under maintenance."
-                                });
-                            }
-
-                            // Record checkout
-                            db.query(
-                                `INSERT INTO transactions
-                                 (user_id, equipment_id, status)
-                                 VALUES (?, ?, 'ACTIVE')`,
-                                [user_id, equipment_id],
-                                (err, result) => {
-                                    if (err) {
-                                        return res.status(500).json({ error: err.message });
-                                    }
-
-                                    // Decrement available_quantity and set status to OUT_OF_STOCK if 0
-                                    db.query(
-                                        `UPDATE equipment
-                                         SET available_quantity = GREATEST(0, COALESCE(available_quantity, 50) - 1),
-                                             status = CASE WHEN (COALESCE(available_quantity, 50) - 1) <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END
-                                         WHERE equipment_id = ?`,
-                                        [equipment_id],
-                                        (err, updateResult) => {
-                                            if (err) {
-                                                db.query(
-                                                    `DELETE FROM transactions WHERE transaction_id = ?`,
-                                                    [result.insertId]
-                                                );
-                                                return res.status(500).json({ error: err.message });
-                                            }
-
-                                            res.json({
-                                                message: "Equipment checked out successfully",
-                                                transaction_id: result.insertId
-                                            });
-                                        }
-                                    );
-                                }
-                            );
-                        }
-                    );
-                }
-            );
-        }
-    );
+    return res.status(410).json({
+        message: "This quantity-based checkout endpoint is retired. Create a QR request for individual equipment units."
+    });
 });
 
 // Student creates a one-time return QR for an active transaction.
@@ -1118,80 +1015,10 @@ app.post("/api/admin/return-qr/confirm", authenticateToken, requireAdmin, (req, 
     });
 });
 
-// Return equipment API
+// Legacy quantity-based return is disabled. Use transaction-specific return QR confirmation.
 app.post("/api/return", authenticateToken, (req, res) => {
-    if (String(req.user.role || "").toLowerCase() !== "admin") {
-        return res.status(403).json({ message: "Student returns must use the return QR and admin confirmation workflow." });
-    }
-
-    const { equipment_id } = req.body || {};
-    const currentUserId = req.user.user_id;
-    const isAdministrator = String(req.user.role || "").toLowerCase() === "admin";
-
-    if (!equipment_id) {
-        return res.status(400).json({
-            message: "Equipment ID is required"
-        });
-    }
-
-    const sql = `
-        SELECT transaction_id
-        FROM transactions
-        WHERE equipment_id = ?
-          AND status = 'ACTIVE'
-          AND (? = 1 OR user_id = ?)
-        ORDER BY checkout_time DESC
-        LIMIT 1
-    `;
-
-    db.query(sql, [equipment_id, isAdministrator ? 1 : 0, currentUserId], (err, results) => {
-        if (err) {
-            return res.status(500).json({ error: err.message });
-        }
-
-        if (results.length === 0) {
-            return res.status(400).json({
-                message: "No active checkout found"
-            });
-        }
-
-        const transactionId = results[0].transaction_id;
-
-        db.query(
-            `UPDATE transactions
-             SET status = 'RETURNED', return_time = NOW()
-             WHERE transaction_id = ? AND status = 'ACTIVE'`,
-            [transactionId],
-            (err, result) => {
-                if (err) {
-                    return res.status(500).json({ error: err.message });
-                }
-
-                if (result.affectedRows === 0) {
-                    return res.status(409).json({
-                        message: "This transaction has already been returned"
-                    });
-                }
-
-                // Increment available_quantity and set status to AVAILABLE
-                db.query(
-                    `UPDATE equipment
-                     SET available_quantity = LEAST(COALESCE(total_quantity, 50), COALESCE(available_quantity, 0) + 1),
-                         status = 'AVAILABLE'
-                     WHERE equipment_id = ?`,
-                    [equipment_id],
-                    (err, updateResult) => {
-                        if (err) {
-                            return res.status(500).json({ error: err.message });
-                        }
-
-                        res.json({
-                            message: "Equipment returned successfully"
-                        });
-                    }
-                );
-            }
-        );
+    return res.status(410).json({
+        message: "This quantity-based return endpoint is retired. Create a return QR for the exact active transaction."
     });
 });
 
