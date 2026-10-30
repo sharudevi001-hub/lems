@@ -63,7 +63,7 @@ async function main() {
     if (!rfidColumns.length) throw new Error("Required column equipment.rfid_tag is missing.");
     if (rfidColumns[0].IS_NULLABLE !== "YES") {
       const safeType = String(rfidColumns[0].COLUMN_TYPE || "").toUpperCase();
-      if (!/^(VARCHAR|CHAR)\\(\\d+\\)$/.test(safeType)) throw new Error("Unsupported equipment.rfid_tag type; manual review is required before making RFID optional.");
+      if (!/^(VARCHAR|CHAR)\(\d+\)$/.test(safeType)) throw new Error("Unsupported equipment.rfid_tag type; manual review is required before making RFID optional.");
       await connection.query("ALTER TABLE equipment MODIFY COLUMN rfid_tag " + safeType + " NULL");
       console.log("Made equipment.rfid_tag optional; RFID can be linked after unit creation.");
     } else console.log("equipment.rfid_tag already allows NULL");
