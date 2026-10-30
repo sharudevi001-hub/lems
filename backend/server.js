@@ -93,7 +93,6 @@ const requireAdmin = (req, res, next) => {
     }
     next();
 };
-};
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 20,
