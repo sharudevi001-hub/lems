@@ -703,8 +703,11 @@ app.post("/api/checkout-requests", authenticateToken, (req, res) => {
                     const equipment = byId.get(item.equipment_id);
                     return { equipment_code: equipment?.equipment_code || String(item.equipment_id), requested: item.quantity, available: Number(equipment?.available_quantity || 0) };
                 });
+                if (items.some(item => item.quantity !== 1)) {
+                    return connection.rollback(() => { connection.release(); res.status(400).json({ message: "Select individual physical unit records. Each equipment ID can be requested once." }); });
+                }
                 if (unavailable.length) {
-                    return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Requested quantity exceeds available stock or equipment is unavailable.", unavailable }); });
+                    return connection.rollback(() => { connection.release(); res.status(409).json({ message: "One or more selected physical units are unavailable. Refresh inventory and try again.", unavailable }); });
                 }
                 connection.query("INSERT INTO checkout_requests (user_id, token_hash, status) VALUES (?, ?, 'PENDING')", [req.user.user_id, tokenHash], (insertError, result) => {
                     if (insertError) return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not create checkout request. Apply the reviewed quantity/return migration first." }); });
@@ -779,19 +782,16 @@ app.post("/api/admin/checkout-requests/issue", authenticateToken, requireAdmin, 
                 if (request.status !== "PENDING") return connection.rollback(() => { connection.release(); res.status(409).json({ message: "This QR has already been used or cancelled.", status: request.status }); });
                 connection.query("SELECT e.equipment_id, e.equipment_code, e.status, COALESCE(e.available_quantity, 1) AS available_quantity, COALESCE(i.quantity, 1) AS quantity FROM checkout_request_items i JOIN equipment e ON e.equipment_id = i.equipment_id WHERE i.request_id = ? FOR UPDATE", [request.request_id], (itemsError, items) => {
                     if (itemsError || !items.length) return connection.rollback(() => { connection.release(); res.status(itemsError ? 500 : 400).json({ message: "No equipment found in this checkout request." }); });
-                    if (items.some(item => String(item.status).toUpperCase() !== "AVAILABLE" || Number(item.available_quantity) < Number(item.quantity || 1))) {
-                        return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Requested stock is no longer available. No equipment was issued; create a new request after refreshing inventory." }); });
+                    if (items.some(item => String(item.status).toUpperCase() !== "AVAILABLE" || Number(item.available_quantity) < 1 || Number(item.quantity || 1) !== 1)) {
+                        return connection.rollback(() => { connection.release(); res.status(409).json({ message: "Each checkout request must identify one available physical unit. Refresh inventory and select individual unit codes." }); });
                     }
-                    const transactionRows = [];
-                    for (const item of items) {
-                        for (let count = 0; count < Number(item.quantity || 1); count++) transactionRows.push([request.user_id, item.equipment_id, "ACTIVE"]);
-                    }
+                    const transactionRows = items.map(item => [request.user_id, item.equipment_id, "ACTIVE"]);
                     connection.query("INSERT INTO transactions (user_id, equipment_id, status, checkout_request_id) VALUES ?", [transactionRows.map(row => [row[0],row[1],row[2],request.request_id])], insertError => {
                         if (insertError) { console.error("[checkout issue] transaction insert failed:", insertError.code || "UNKNOWN", insertError.message || "No database error message"); return connection.rollback(() => { connection.release(); res.status(500).json({ message: "Could not record the equipment issue." }); }); }
                         let remaining = items.length;
                         let updateFailed = false;
                         items.forEach(item => {
-                            connection.query("UPDATE equipment SET available_quantity = GREATEST(0, COALESCE(available_quantity, 1) - ?), status = CASE WHEN COALESCE(available_quantity, 1) - ? <= 0 THEN 'IN_USE' ELSE 'AVAILABLE' END WHERE equipment_id = ? AND COALESCE(available_quantity, 1) >= ?", [item.quantity, item.quantity, item.equipment_id, item.quantity], (updateError, updateResult) => {
+                            connection.query("UPDATE equipment SET available_quantity = 0, status = 'IN_USE' WHERE equipment_id = ? AND status = 'AVAILABLE' AND COALESCE(available_quantity, 1) >= 1", [item.equipment_id], (updateError, updateResult) => {
                                 if (updateError || updateResult.affectedRows !== 1) updateFailed = true;
                                 remaining--;
                                 if (remaining !== 0) return;
