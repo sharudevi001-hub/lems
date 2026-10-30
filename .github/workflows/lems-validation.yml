@@ -5,10 +5,10 @@ on:
     branches:
       - lems/full-spec-staged-implementation
       - fix/individual-equipment-maintenance
-      - remove/rfid-use-qr-only
   push:
     branches:
       - fix/individual-equipment-maintenance
+      - remove/rfid-use-qr-only
 
 permissions:
   contents: read
