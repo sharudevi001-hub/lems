@@ -996,8 +996,8 @@ app.post("/api/admin/return-requests/confirm", authenticateToken, requireAdmin, 
                             if (txError || txResult.affectedRows !== 1) { failed = true; return next(); }
                             const damaged = item.condition_status === "DAMAGED" || item.condition_status === "MISSING_PARTS";
                             const stockSql = damaged
-                                ? "UPDATE equipment SET status='MAINTENANCE' WHERE equipment_id=?"
-                                : "UPDATE equipment SET available_quantity=LEAST(COALESCE(total_quantity,1),COALESCE(available_quantity,0)+1),status=CASE WHEN COALESCE(available_quantity,0)+1>0 THEN 'AVAILABLE' ELSE status END WHERE equipment_id=?";
+                                ? "UPDATE equipment SET status='MAINTENANCE', available_quantity=0 WHERE equipment_id=?"
+                                : "UPDATE equipment SET status=CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id=equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) THEN 'MAINTENANCE' WHEN EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id=equipment.equipment_id AND t.status='ACTIVE') THEN 'IN_USE' ELSE 'AVAILABLE' END, available_quantity=CASE WHEN EXISTS (SELECT 1 FROM complaints c WHERE c.equipment_id=equipment.equipment_id AND c.status NOT IN ('RESOLVED','REJECTED')) OR EXISTS (SELECT 1 FROM transactions t WHERE t.equipment_id=equipment.equipment_id AND t.status='ACTIVE') THEN 0 ELSE 1 END WHERE equipment_id=?";
                             connection.query(stockSql, [item.equipment_id], stockError => {
                                 if (stockError) { failed = true; return next(); }
                                 connection.query("INSERT INTO equipment_condition_reports (transaction_id,equipment_id,user_id,return_session_id,condition_status,notes) VALUES (?,?,?,?,?,?)", [item.transaction_id,item.equipment_id,session.user_id,session.return_session_id,item.condition_status,item.condition_notes||null], reportError => {
